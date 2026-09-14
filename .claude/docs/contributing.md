@@ -1,6 +1,6 @@
 # Contributing
 
-Start off any modification or debugging with SkyRL using this file as the primary instruction manual. Before coming up with a plan, ensure you have thoroughly gone through the instructions here as well as relevant documentation in `docs/`. (Ex: for understanding configuration, go through `docs/content/docs/configuration/config.mdx`)
+Start off any modification or debugging with SkyRL using this file as the primary instruction manual. Before coming up with a plan, ensure you have thoroughly gone through the instructions here as well as relevant documentation in `docs/`. (Ex: for understanding configuration, go through the config dataclasses and their docstrings in `skyrl/train/config/config.py`; the `/docs/api-ref/skyrl/config` reference page is generated from them.)
 
 **Google Style Guide**: Overall, you should follow Google's Python Style Guide while writing code for the project, unless specifically instructed by the user or by instructions here. 
 
@@ -32,9 +32,10 @@ Start off any modification or debugging with SkyRL using this file as the primar
 
 1. **Check Megatron-Bridge support** — The model needs a provider in Megatron-Bridge. Check available branches/commits for the model's provider class.
 2. **Check dependency compatibility** — New architectures may need additional deps (e.g., `mamba-ssm` for Mamba). Verify no conflicts with existing pins.
-3. **Test inference first** — Add a test case to `test_engine_generation.py` (token-based generation).
-4. **Test Megatron forward** — Add a test case to `test_megatron_worker.py` comparing HF vs Megatron logprobs.
-5. **Create example script** — Add to `examples/train/<model>/` with README and training script.
+3. **Minimal Generation + Logprobs test** — Add a test case to `tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_megatron_models.py` comparing HF vs Megatron logprobs and performing a test generation. If the model is large, you can use a tiny model similar to the `eatang/qwen3.5-moe-tiny-random` model in the test. Success criteria:
+    1. Logprobs difference should be low (typically < 0.01).
+    2. If using a model with pretrained weights (instead of a tiny model with random weights), then generation should be coherent before and after weight sync.
+4. **Create example script** — Add to `examples/train/<model>/` with README and training script.
 
 ## Tokenizer Quirks
 
@@ -46,6 +47,52 @@ Start off any modification or debugging with SkyRL using this file as the primar
 - Using Ray tasks/ actors with `fork` start method  - This leads to undefined behaviour. Use `spawn` start method instead.
 - Passing the full `SkyRLTrainConfig` as an argument to a method or a class when only a sub-config is sufficient (example: `InferenceEngineConfig`)
 
+
+## Pull request descriptions
+
+Open with `# What does this PR do?` and a TLDR sentence, then explain the
+mechanism before the fix. A reviewer should be able to reconstruct *why* the
+change is correct without reading the diff first.
+
+Structure for most PRs (drop what does not apply):
+
+- `# What does this PR do?` — one or two sentences, then a `TLDR:` line for
+  anything non-trivial. Link the failing CI job, the issue, or the design doc.
+- `## Why it happens` — for bug fixes, the causal chain, numbered when there are
+  steps. Name the mechanism, not just the symptom.
+- `## Usage` / `## Endpoints` — for a feature, how it is invoked and what the
+  new surface is. This is usually the part reviewers need most.
+- `## Solution` / `## How it works` — what was done, and the alternatives that
+  were considered with the reason each was rejected. Reviewers ask "why not X"
+  anyway; answer it in the description. Keep this to what a reviewer cannot
+  infer: internal structure that is standard for SkyRL belongs in a design doc,
+  not the PR.
+- `## Test plan` — what the new tests assert and why that set is sufficient.
+- `## Validation` — hardware, the exact command run, and results. A before/after
+  table is clearer than a paragraph.
+
+Do:
+
+- Quote the actual error, verbatim and short. `RuntimeError: Expected no
+  weakrefs to t1's Tensor object but got 6` tells a reviewer more than "a
+  tensor-swapping error".
+- Give real numbers: "4 failed / 40 passed" before, "1 failed / 43 passed"
+  after. Say which failures are pre-existing or flaky, and why you believe it.
+- Put stacktraces, long logs and failing-test output in a `<details>` block so
+  the description stays scannable.
+- Call out constraints a reviewer has to know about (a required config flag,
+  an extra a CI job does not install) under their own heading.
+- Link upstream PRs, docs pages and examples that the change depends on or adds.
+
+Don't:
+
+- Narrate the journey ("first I tried X, then discovered Y"). State what is
+  true now.
+- Use mannered prose. Don't reach for metaphor when a literal phrase exists.
+  Write "a parameter worth varying", not "a dial worth turning"; 
+  "this still matters", not "this earns its keep".
+  Metaphors carry connotations you did not choose, and they make the
+  reader work harder so the writer can perform.
 
 ## Comments
 

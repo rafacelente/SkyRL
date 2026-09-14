@@ -6,6 +6,7 @@ import torch.distributed as dist
 
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl.backends.skyrl_train.training_batch import TensorBatch, TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.dataset.bin_packing import make_seq_packer
 from skyrl.train.dataset.replay_buffer import Experience
@@ -27,6 +28,16 @@ MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_P
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_MAX_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_max"
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_MIN_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_min"
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_STD_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_std"
+
+
+def get_inference_weight_prefix(is_multimodal_lm_only: bool) -> str:
+    """Return the enclosing inference-model prefix omitted by language-only loading.
+
+    Shared by full-weight and LoRA exports. This preserves the existing assumption
+    that the inference VLM exposes its text model under ``language_model``; it is
+    not a universal naming convention for all VLM architectures.
+    """
+    return "language_model." if is_multimodal_lm_only else ""
 
 
 @torch.no_grad()
@@ -158,10 +169,11 @@ class BaseBatchIterator:
             advantages=batch.get("advantages"),
             attention_mask=batch.get("attention_mask"),
             loss_mask=batch.get("loss_mask"),
-            action_mask=batch.get("response_mask"),
+            response_mask=batch.get("response_mask"),
             num_actions=batch.metadata["response_length"],  # int
             rollout_logprobs=batch.get("rollout_logprobs"),
             rollout_expert_indices=batch.get("rollout_expert_indices"),
+            router_padding_mask=batch.get("router_padding_mask"),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
             info={},
@@ -325,9 +337,13 @@ class TokenBasedBatchIterator(BaseBatchIterator):
             data["rollout_logprobs"] = torch.zeros((batch_size, num_actions), dtype=ref_tensor.dtype, device=device)
         if self.data.get("rollout_expert_indices") is not None:
             ref_tensor = self.data["rollout_expert_indices"]
-            data["rollout_expert_indices"] = torch.zeros(
-                (batch_size, *ref_tensor.shape[1:]), dtype=ref_tensor.dtype, device=device
+            data["rollout_expert_indices"] = make_replay_padding_indices(
+                (batch_size, *ref_tensor.shape[1:]),
+                dtype=ref_tensor.dtype,
+                device=device,
             )
+        if self.data.get("router_padding_mask") is not None:
+            data["router_padding_mask"] = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
         data.metadata = {}
         if self.data.metadata:
             data.metadata.update(self.data.metadata)
@@ -417,6 +433,18 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         reordered_batch = type(ref_microbatch)(reordered_data)
         reordered_batch.metadata = ref_microbatch.metadata
         return reordered_batch
+
+    def reorder_and_combine_items(self, batches: List[List[dict]]) -> List[dict]:
+        """Restore per-sample microbatch outputs to input order."""
+        ordered = [None] * self.data.batch_size
+        for original_indices, items in zip(self._microbatches, batches):
+            if len(items) < len(original_indices):
+                raise ValueError("Microbatch output has fewer items than input samples")
+            for original_idx, item in zip(original_indices, items):
+                ordered[original_idx] = item
+        if any(item is None for item in ordered):
+            raise ValueError("Microbatch outputs do not cover every input sample")
+        return ordered
 
 
 def get_microbatch_iterator(
