@@ -1,23 +1,24 @@
 """
-SFT (Supervised Fine-Tuning) trainer for SkyRL.
+Value-model trainer for SkyRL.
 
-Supports both FSDP and Megatron backends via a single ``SFTTrainer`` class.
-The backend is selected dynamically based on ``SFTConfig.strategy``.
+Uses the SFT training loop to train a token-level binary classifier (same-position
+labels in ``reward_binary``) instead of next-token prediction. FSDP and
+Megatron (DP/TP/CP) are supported.
 
 Usage::
 
     from skyrl.train.config.sft_config import SFTConfig, SFTPlacementConfig
-    from skyrl.train.sft_trainer import SFTTrainer
+    from skyrl.train.value_model_trainer import ValueModelTrainer
 
-    cfg = SFTConfig(strategy="megatron")
-    trainer = SFTTrainer(cfg)
+    cfg = SFTConfig(strategy="fsdp", value_model_training=True)
+    trainer = ValueModelTrainer(cfg)
     trainer.setup()
     trainer.train()
     trainer.shutdown()
 
 Or as a CLI entrypoint::
 
-    python -m skyrl.train.main_sft strategy=megatron model.path=Qwen/Qwen3-0.6B
+    python -m skyrl.train.main_value_model strategy=fsdp model.path=Qwen/Qwen3-0.6B
 """
 
 import functools
@@ -53,6 +54,7 @@ from skyrl.train.config.sft_config import (
     _normalize_dataset_cfg,
     build_skyrl_config_for_sft,
 )
+from skyrl.train.sft_trainer import _reward_labels_for_example
 from skyrl.train.dataset.pretokenized import load_from_pretokenized
 from skyrl.train.dataset.sft_dataset import ConcatSFTDataset, SFTDataset, TextDataset
 from skyrl.train.generators.utils import (
@@ -80,6 +82,23 @@ from skyrl.utils.tok import (
     get_processor,
     get_tokenizer,
 )
+
+def _load_raw_dataset(dataset_name: str, dataset_split: str):
+    """Load a HuggingFace dataset, including local json/jsonl/parquet files."""
+    if dataset_name.endswith((".jsonl", ".json")):
+        return load_dataset("json", data_files=dataset_name, split=dataset_split)
+    if dataset_name.endswith(".parquet"):
+        return load_dataset("parquet", data_files=dataset_name, split=dataset_split)
+    if os.path.isdir(dataset_name) and os.path.exists(os.path.join(dataset_name, "dataset_info.json")):
+        from datasets import load_from_disk
+
+        dataset = load_from_disk(dataset_name)
+        if dataset_split and hasattr(dataset, "keys"):
+            split_name = dataset_split.split("[")[0]
+            dataset = dataset[split_name]
+        return dataset
+    return load_dataset(dataset_name, split=dataset_split)
+
 
 # ---------------------------------------------------------------------------
 # Tokenization helpers
@@ -119,7 +138,7 @@ def _tokenize_chat_slice_worker(args):
 
     # Reload the dataset using the original split string and slice by index.
     # The parent has already loaded once so this hits the HF cache.
-    dataset = load_dataset(dataset_name, split=dataset_split)
+    dataset = _load_raw_dataset(dataset_name, dataset_split)
     dataset_slice = dataset.select(range(start_idx, end_idx))
 
     # Tokenize and filter inline
@@ -159,7 +178,7 @@ def _tokenize_alpaca_slice_worker(args):
     )
 
     # Reload the dataset using the original split string and slice by index.
-    dataset = load_dataset(dataset_name, split=dataset_split)
+    dataset = _load_raw_dataset(dataset_name, dataset_split)
     dataset_slice = dataset.select(range(start_idx, end_idx))
 
     # Tokenize and filter inline
@@ -213,6 +232,7 @@ def _compute_cache_key(
             "train_on_what": train_on_what,
             "tools_key": tools_key,
             "system_key": system_key,
+            "objective": "value_model",
         },
         sort_keys=True,
     )
@@ -364,7 +384,9 @@ def _normalize_tool_call_payload(tc: Any) -> Optional[list]:
     out = []
     for call in tc:
         if not isinstance(call, dict):
-            raise TypeError(f"tool call entry must be a dict, got {type(call).__name__}")
+            raise TypeError(
+                f"tool call entry must be a dict, got {type(call).__name__}"
+            )
         fn = call["function"] if isinstance(call.get("function"), dict) else call
         arguments = fn.get("arguments", {})
         if isinstance(arguments, str):
@@ -372,7 +394,12 @@ def _normalize_tool_call_payload(tc: Any) -> Optional[list]:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
                 pass
-        out.append({"type": "function", "function": {"name": fn.get("name"), "arguments": arguments}})
+        out.append(
+            {
+                "type": "function",
+                "function": {"name": fn.get("name"), "arguments": arguments},
+            }
+        )
     return out
 
 
@@ -404,7 +431,9 @@ def _normalize_chat_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
-def tokenize_sft_example(example: dict, tokenizer, max_length: int = 512, **tokenizer_kwargs) -> dict | None:
+def tokenize_sft_example(
+    example: dict, tokenizer, max_length: int = 512, **tokenizer_kwargs
+) -> dict | None:
     """Tokenize an Alpaca-format SFT example via ``apply_chat_template``.
 
     Converts the instruction/input/output fields into a two-message chat
@@ -430,23 +459,46 @@ def tokenize_sft_example(example: dict, tokenizer, max_length: int = 512, **toke
         {"role": "assistant", "content": output},
     ]
 
-    tokenized = tokenize_chat_example(
-        {"messages": messages},
+    payload = {"messages": messages}
+    if "reward_binary" in example:
+        payload["reward_binary"] = example["reward_binary"]
+    return tokenize_chat_example(
+        payload,
         tokenizer,
         max_length=max_length,
         messages_key="messages",
         **tokenizer_kwargs,
     )
-    return _attach_reward_binary(example, tokenized)
 
 
 def _attach_reward_binary(example: dict, tokenized: dict | None) -> dict | None:
-    """Copy a dataset-provided ``reward_binary`` column onto the tokenized row."""
+    """Copy a dataset-provided ``reward_binary`` column onto the tokenized row.
+
+    Value-model training requires the column; missing labels fail here so the
+    dataset error surfaces at tokenize time rather than inside the worker.
+    """
     if tokenized is None:
         return None
-    if "reward_binary" in example:
-        tokenized["reward_binary"] = example["reward_binary"]
+    if "reward_binary" not in example:
+        raise ValueError(
+            "Value-model datasets must include a 'reward_binary' column on every "
+            "example (scalar 0/1, a per-token vector of length seq_len, or a "
+            "response-window vector of length num_actions)."
+        )
+    tokenized["reward_binary"] = example["reward_binary"]
     return tokenized
+
+
+def _ensure_reward_binary(tokenized: list) -> None:
+    """Fail fast if any tokenized row is missing value-model labels."""
+    if not tokenized:
+        return
+    missing = [i for i, ex in enumerate(tokenized) if "reward_binary" not in ex]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} tokenized example(s) are missing 'reward_binary' "
+            f"(first index {missing[0]}). Value-model datasets must include this column."
+        )
 
 
 def tokenize_chat_example(
@@ -490,7 +542,10 @@ def tokenize_chat_example(
         window).  Returns ``None`` when the example should be skipped.
     """
     # Validate supported modes
-    _SUPPORTED = {TrainOnWhat.LAST_ASSISTANT_MESSAGE, TrainOnWhat.ALL_ASSISTANT_MESSAGES}
+    _SUPPORTED = {
+        TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+        TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    }
     if train_on_what not in _SUPPORTED:
         raise NotImplementedError(
             f"train_on_what={train_on_what!r} is not yet supported. "
@@ -526,15 +581,23 @@ def tokenize_chat_example(
         for m in messages
     )
     if has_images and train_on_what == TrainOnWhat.ALL_ASSISTANT_MESSAGES:
-        raise NotImplementedError("Training on all assistant messages with vision inputs is not yet supported")
+        raise NotImplementedError(
+            "Training on all assistant messages with vision inputs is not yet supported"
+        )
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
         tokenized = _tokenize_chat_last_assistant(
-            messages, tokenizer, max_length, processor if has_images else None, **tokenizer_kwargs
+            messages,
+            tokenizer,
+            max_length,
+            processor if has_images else None,
+            **tokenizer_kwargs,
         )
     else:
         # ALL_ASSISTANT_MESSAGES
-        tokenized = _tokenize_chat_all_assistants(messages, tokenizer, max_length, **tokenizer_kwargs)
+        tokenized = _tokenize_chat_all_assistants(
+            messages, tokenizer, max_length, **tokenizer_kwargs
+        )
     return _attach_reward_binary(example, tokenized)
 
 
@@ -608,7 +671,11 @@ def _tokenize_chat_last_assistant(
 
     # VLM samples can't be safely truncated (it would drop image placeholder tokens
     # and break image/text alignment), so drop anything that exceeds the limit.
-    if processor is not None and max_length is not None and len(full_input_ids) > max_length:
+    if (
+        processor is not None
+        and max_length is not None
+        and len(full_input_ids) > max_length
+    ):
         logger.warning(
             f"Dropping VLM sample longer than max_length={max_length}, consider increasing max_length if you see this warning too much"
         )
@@ -706,50 +773,28 @@ def _tokenize_chat_all_assistants(
 # ---------------------------------------------------------------------------
 
 
-def _reward_labels_for_example(ex: dict, seq_len: int, num_actions: int) -> np.ndarray:
-    """Build same-position integer class labels for one example.
-
-    ``reward_binary`` may be a scalar (broadcast to every token), a full-sequence
-    vector of length ``seq_len``, or a response-window vector of length
-    ``num_actions``.
-    """
-    raw = np.asarray(ex["reward_binary"], dtype=np.int64)
-    if raw.ndim == 0:
-        return np.full(seq_len, int(raw), dtype=np.int64)
-    if raw.shape[0] == seq_len:
-        return raw
-    if raw.shape[0] == num_actions:
-        labels = np.zeros(seq_len, dtype=np.int64)
-        labels[seq_len - num_actions :] = raw
-        return labels
-    raise ValueError(
-        f"reward_binary length {raw.shape[0]} must be scalar, seq_len={seq_len}, or num_actions={num_actions}"
-    )
-
-
 def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
     """Collate tokenized examples into a TrainingInputBatch.
 
-    Creates the batch format expected by forward_backward with cross_entropy loss:
-    - sequences: [batch_size, seq_len] - token IDs (left-padded)
-    - attention_mask: [batch_size, seq_len] - 1 for real tokens, 0 for padding
-    - loss_mask: [batch_size, num_actions] - 1 for tokens to compute loss on
-
-    All examples are expected to carry a ``loss_mask`` key (guaranteed by both
-    ``_tokenize_chat_last_assistant`` and ``_tokenize_chat_all_assistants``).
+    Same layout as SFT, plus same-position ``rewards`` from ``reward_binary``.
+    Every example must carry ``reward_binary``.
     """
+    if not all("reward_binary" in ex for ex in examples):
+        raise ValueError(
+            "Value-model collation requires 'reward_binary' on every example. "
+            "Add a reward_binary column (scalar, seq_len, or num_actions) to the dataset."
+        )
     max_len = max(len(ex["input_ids"]) for ex in examples)
     max_num_actions = max(ex["num_actions"] for ex in examples)
     num_examples = len(examples)
 
     # Fill NumPy buffers by slice, then convert once.
-    sequences_np = np.full((num_examples, max_len), tokenizer.pad_token_id, dtype=np.int64)
+    sequences_np = np.full(
+        (num_examples, max_len), tokenizer.pad_token_id, dtype=np.int64
+    )
     attention_mask_np = np.zeros((num_examples, max_len), dtype=np.int64)
     loss_mask_np = np.zeros((num_examples, max_num_actions), dtype=np.int64)
-    has_rewards = any("reward_binary" in ex for ex in examples)
-    if has_rewards and not all("reward_binary" in ex for ex in examples):
-        raise ValueError("Mixed batches: some examples have reward_binary and some do not")
-    rewards_np = np.zeros((num_examples, max_len), dtype=np.int64) if has_rewards else None
+    rewards = np.zeros((num_examples, max_len), dtype=np.int64)
 
     # VLM image tensors travel as a TensorList (one variable-shape tensor per
     # sample). Mixed text+image batches are not supported; every sample in a VLM
@@ -767,14 +812,16 @@ def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
 
     for i, ex in enumerate(examples):
         # Left-pad sequences; right-align response loss masks.
-        pad_len = max_len - len(ex["input_ids"])
+        len_input_ids = len(ex["input_ids"])
+        pad_len = max_len - len_input_ids
         sequences_np[i, pad_len:] = ex["input_ids"]
         attention_mask_np[i, pad_len:] = ex["attention_mask"]
 
         action_pad = max_num_actions - ex["num_actions"]
         loss_mask_np[i, action_pad:] = ex["loss_mask"]
-        if has_rewards:
-            rewards_np[i, pad_len:] = _reward_labels_for_example(ex, len(ex["input_ids"]), ex["num_actions"])
+        rewards[i, pad_len:] = _reward_labels_for_example(
+            ex, len_input_ids, ex["num_actions"]
+        )
 
         if batch_has_images:
             pixel_values.append(torch.as_tensor(ex["pixel_values"]))
@@ -787,7 +834,7 @@ def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
             "loss_mask": torch.from_numpy(loss_mask_np),
             "pixel_values": TensorList(pixel_values) if batch_has_images else None,
             "image_grid_thw": TensorList(image_grid_thw) if batch_has_images else None,
-            **({"rewards": torch.from_numpy(rewards_np)} if has_rewards else {}),
+            "rewards": torch.from_numpy(rewards),
         }
     )
     batch.metadata = {"response_length": max_num_actions}
@@ -821,7 +868,7 @@ def collate_sft_examples(
 
 
 # ---------------------------------------------------------------------------
-# SFTTrainer
+# ValueModelTrainer
 # ---------------------------------------------------------------------------
 
 
@@ -830,16 +877,16 @@ def _format_eval_metrics(eval_metrics: dict) -> str:
     return ", ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items())
 
 
-class SFTTrainer:
-    """SFT trainer supporting FSDP and Megatron backends.
+class ValueModelTrainer:
+    """Trainer for a token-level binary value / reward model.
 
-    Unlike RayPPOTrainer, this does NOT subclass it. SFT's concerns are
-    fundamentally different: no generation, no critic, no advantages, no
-    KL penalty. Sharing a base class would create confusing dead code paths.
+    Reuses the SFT loop (no generation, no critic, no advantages) but trains a
+    2-class head on same-position ``reward_binary`` labels. FSDP and Megatron
+    (DP/TP/CP) are both supported.
 
     Usage::
 
-        trainer = SFTTrainer(SFTConfig(strategy="megatron"))
+        trainer = ValueModelTrainer(SFTConfig(strategy="megatron"))
         trainer.setup()
         trainer.train()
         trainer.shutdown()
@@ -855,7 +902,12 @@ class SFTTrainer:
         _normalize_dataset_cfg(cfg)
         # Accept a pre-built bridge config to avoid redundant rebuilds.
         # When not provided (e.g. standalone usage), build it here.
-        self.cfg = skyrl_cfg if skyrl_cfg is not None else build_skyrl_config_for_sft(cfg)
+        self.cfg = (
+            skyrl_cfg if skyrl_cfg is not None else build_skyrl_config_for_sft(cfg)
+        )
+        # Dedicated value-model trainer: always use the token-level classifier path.
+        self.cfg.trainer.value_model_training = True
+        self.sft_cfg.value_model_training = True
         self.tokenizer = None
         self.processor = None  # set in setup() for VLM models
         self.is_vlm = False
@@ -873,7 +925,9 @@ class SFTTrainer:
         self._total_tokens_processed = 0
         self.collator = None  # built in setup() once the tokenizer is available
 
-        self._num_training_gpus: int = cfg.placement.num_nodes * cfg.placement.num_gpus_per_node
+        self._num_training_gpus: int = (
+            cfg.placement.num_nodes * cfg.placement.num_gpus_per_node
+        )
         self._ray_gpu_monitor = RayGpuMonitor() if cfg.enable_ray_gpu_monitor else None
 
         self._callback_handler = CallbackHandler(callbacks)
@@ -889,45 +943,28 @@ class SFTTrainer:
         return self.cfg.trainer.policy.torch_profiler_config.enable
 
     def _build_collator(self, tokenizer):
-        """Select the batch collator from the configured packing mode.
+        """Build the unpacked ``DefaultCollator`` with value-model collation.
 
-        ``PackedDataCollator`` performs controller-level FFD bin-packing
-        (Megatron-only, ``use_sequence_packing=True``); ``DefaultCollator``
-        left-pads each example. The choice is fixed by static config; the
-        ``tokenizer`` is passed in by :meth:`setup` once it is available. The
-        packed config is validated here.
+        Sequence packing is not supported for the binary value head yet.
         """
-        # Imported lazily to avoid a circular import: ``collators`` imports
-        # ``collate_sft_batch`` from this module.
-        from skyrl.train.dataset.collators import DefaultCollator, PackedDataCollator
+        from skyrl.train.dataset.collators import DefaultCollator
 
         if self.sft_cfg.use_sequence_packing:
-            from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
-                is_fp8_enabled,
-            )
-
-            self._validate_packing_cfg()
-            transformer_config_kwargs = self.sft_cfg.megatron_config.transformer_config_kwargs or {}
-            return PackedDataCollator(
-                tokenizer=tokenizer,
-                max_tokens_per_microbatch=self.sft_cfg.resolved_bin_capacity(),
-                tp_size=self.sft_cfg.megatron_config.tensor_model_parallel_size,
-                pp_size=self.sft_cfg.megatron_config.pipeline_model_parallel_size,
-                cp_size=self.sft_cfg.megatron_config.context_parallel_size,
-                dp_size=self._dp_size(),
-                batch_size=self.sft_cfg.batch_size,
-                micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
-                fp8_enabled=is_fp8_enabled(transformer_config_kwargs.get("fp8")),
-                fp8_recipe=transformer_config_kwargs.get("fp8_recipe"),
+            raise ValueError(
+                "Value-model training does not support controller-level use_sequence_packing "
+                "yet. Megatron THD packing (remove_microbatch_padding=True) and CP still work."
             )
         return DefaultCollator(
             tokenizer=tokenizer,
             micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+            collate_fn=collate_sft_batch,
         )
 
     def _dp_size(self) -> int:
         """Number of DP ranks under the configured Megatron parallelism."""
-        total_gpus = self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        total_gpus = (
+            self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        )
         tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
         pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
         cp = self.sft_cfg.megatron_config.context_parallel_size
@@ -966,20 +1003,31 @@ class SFTTrainer:
             "padding_side": "left",
         }
 
-        self.is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        self.is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path) and not (
+            self.cfg.trainer.policy.language_model_only
+        )
         if self.is_vlm:
-            self.processor = get_processor(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
+            self.processor = get_processor(
+                self.cfg.trainer.policy.model.path, **tokenizer_kwargs
+            )
             # Sequence packing / microbatch padding removal are unsupported for
             # VLMs (3D RoPE + image token positions). ``remove_microbatch_padding``
             # defaults to True, so disable both unconditionally and mirror the
             # change onto the already-built trainer config the workers receive.
-            if self.sft_cfg.use_sequence_packing or self.sft_cfg.remove_microbatch_padding:
-                logger.warning("VLM detected: disabling sequence packing / microbatch padding removal.")
+            if (
+                self.sft_cfg.use_sequence_packing
+                or self.sft_cfg.remove_microbatch_padding
+            ):
+                logger.warning(
+                    "VLM detected: disabling sequence packing / microbatch padding removal."
+                )
             self.sft_cfg.use_sequence_packing = False
             self.sft_cfg.remove_microbatch_padding = False
             self.cfg.trainer.remove_microbatch_padding = False
 
-        self.tokenizer = get_tokenizer(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
+        self.tokenizer = get_tokenizer(
+            self.cfg.trainer.policy.model.path, **tokenizer_kwargs
+        )
         self.collator = self._build_collator(self.tokenizer)
         self._init_tracker()
         self._init_workers()
@@ -1016,7 +1064,9 @@ class SFTTrainer:
             record_memory=self.cfg.trainer.policy.record_memory,
         )
         num_training_steps = (
-            self.sft_cfg.dummy_run_max_steps if self.sft_cfg.dummy_run_full_ctx else self.sft_cfg.num_steps
+            self.sft_cfg.dummy_run_max_steps
+            if self.sft_cfg.dummy_run_full_ctx
+            else self.sft_cfg.num_steps
         )
         if self.sft_cfg.max_training_steps is not None:
             num_training_steps = (
@@ -1032,7 +1082,11 @@ class SFTTrainer:
                 num_training_steps=num_training_steps,
             )
         )
-        ray.get(actor_group.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
+        ray.get(
+            actor_group.async_run_ray_method(
+                "pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id
+            )
+        )
 
         self.dispatch = WorkerDispatch(self.cfg, policy_actor_group=actor_group)
 
@@ -1063,7 +1117,9 @@ class SFTTrainer:
     def _fire(self, event_name: str, **fields) -> None:
         """Build a CallbackInput and dispatch the given event to all callbacks."""
         cb_input = self._build_callback_input(**fields)
-        getattr(self._callback_handler, event_name)(self, cb_input, self._training_control)
+        getattr(self._callback_handler, event_name)(
+            self, cb_input, self._training_control
+        )
 
     # ------------------------------------------------------------------ #
     # Data
@@ -1118,13 +1174,14 @@ class SFTTrainer:
             if not self.sft_cfg.force_recache:
                 cached = _load_from_cache(cache_path)
                 if cached is not None:
+                    _ensure_reward_binary(cached)
                     return cached
 
             logger.info("Cache miss or force_recache=True, tokenizing dataset...")
             logger.info(f"Cache key: {cache_key}")
 
         logger.info(f"Loading dataset '{dataset_name}' split='{dataset_split}'...")
-        dataset = load_dataset(dataset_name, split=dataset_split)
+        dataset = _load_raw_dataset(dataset_name, dataset_split)
 
         columns = dataset.column_names
         num_workers = self.sft_cfg.num_workers
@@ -1133,15 +1190,25 @@ class SFTTrainer:
         # cleanly through the spawn-based worker pool, so VLM tokenization runs
         # sequentially.
         if self.is_vlm and num_workers != 0:
-            logger.warning("VLM detected: forcing sequential tokenization (num_workers=0).")
+            logger.warning(
+                "VLM detected: forcing sequential tokenization (num_workers=0)."
+            )
             num_workers = 0
 
         # Sequential tokenization path
         if num_workers == 0:
             logger.info("Tokenizing dataset (sequential)...")
             if self.sft_cfg.messages_key in columns:
-                tools_key = self.sft_cfg.tools_key if self.sft_cfg.tools_key in columns else None
-                system_key = self.sft_cfg.system_key if self.sft_cfg.system_key in columns else None
+                tools_key = (
+                    self.sft_cfg.tools_key
+                    if self.sft_cfg.tools_key in columns
+                    else None
+                )
+                system_key = (
+                    self.sft_cfg.system_key
+                    if self.sft_cfg.system_key in columns
+                    else None
+                )
                 tokenized = [
                     tokenize_chat_example(
                         ex,
@@ -1156,7 +1223,10 @@ class SFTTrainer:
                     for ex in dataset
                 ]
             elif "instruction" in columns and "output" in columns:
-                tokenized = [tokenize_sft_example(ex, self.tokenizer, self.sft_cfg.max_length) for ex in dataset]
+                tokenized = [
+                    tokenize_sft_example(ex, self.tokenizer, self.sft_cfg.max_length)
+                    for ex in dataset
+                ]
             else:
                 raise ValueError(
                     f"Unrecognized dataset format. Expected '{self.sft_cfg.messages_key}' column "
@@ -1164,7 +1234,10 @@ class SFTTrainer:
                     f"Found columns: {columns}"
                 )
             tokenized = [ex for ex in tokenized if ex is not None]
-            logger.info(f"Tokenized {len(tokenized)} examples (filtered from {len(dataset)})")
+            _ensure_reward_binary(tokenized)
+            logger.info(
+                f"Tokenized {len(tokenized)} examples (filtered from {len(dataset)})"
+            )
 
             # Save to cache if enabled
             if not self.sft_cfg.disable_cache:
@@ -1177,7 +1250,9 @@ class SFTTrainer:
             return tokenized
 
         # Parallel tokenization path with slice-based loading
-        logger.info(f"Tokenizing dataset with {num_workers} workers (slice-based loading)...")
+        logger.info(
+            f"Tokenizing dataset with {num_workers} workers (slice-based loading)..."
+        )
 
         # Cache tokenizer to temp dir for fast worker loading
         tokenizer_cache_dir = tempfile.mkdtemp(prefix="skyrl_tokenizer_")
@@ -1205,8 +1280,16 @@ class SFTTrainer:
 
                 # Prepare worker arguments based on format
                 if self.sft_cfg.messages_key in columns:
-                    tools_key = self.sft_cfg.tools_key if self.sft_cfg.tools_key in columns else None
-                    system_key = self.sft_cfg.system_key if self.sft_cfg.system_key in columns else None
+                    tools_key = (
+                        self.sft_cfg.tools_key
+                        if self.sft_cfg.tools_key in columns
+                        else None
+                    )
+                    system_key = (
+                        self.sft_cfg.system_key
+                        if self.sft_cfg.system_key in columns
+                        else None
+                    )
                     worker_args.append(
                         (
                             dataset_name,
@@ -1245,7 +1328,9 @@ class SFTTrainer:
             else:
                 worker_fn = _tokenize_alpaca_slice_worker
 
-            logger.info(f"Dividing {dataset_size} examples among {len(worker_args)} workers")
+            logger.info(
+                f"Dividing {dataset_size} examples among {len(worker_args)} workers"
+            )
 
             # Use spawn to avoid Ray fork issues
             ctx = mp.get_context("spawn")
@@ -1259,7 +1344,10 @@ class SFTTrainer:
             for chunk_results in results:
                 tokenized.extend(chunk_results)
 
-            logger.info(f"Tokenized {len(tokenized)} examples (filtered from {dataset_size})")
+            logger.info(
+                f"Tokenized {len(tokenized)} examples (filtered from {dataset_size})"
+            )
+            _ensure_reward_binary(tokenized)
 
             # Save to cache if enabled
             if not self.sft_cfg.disable_cache:
@@ -1295,17 +1383,26 @@ class SFTTrainer:
         if self.sft_cfg.pretokenized_dataset_paths:
             # The loader raises on 0 usable rows, so no empty-source check.
             source_names = self.sft_cfg.pretokenized_dataset_paths
-            sources = [load_from_pretokenized(path, max_length=self.sft_cfg.max_length) for path in source_names]
+            sources = [
+                load_from_pretokenized(path, max_length=self.sft_cfg.max_length)
+                for path in source_names
+            ]
         else:
             source_names = self.sft_cfg.train_datasets
-            for name, split in zip(self.sft_cfg.train_datasets, self.sft_cfg.train_dataset_splits):
+            for name, split in zip(
+                self.sft_cfg.train_datasets, self.sft_cfg.train_dataset_splits
+            ):
                 source = self._load_and_tokenize(name, split)
                 if len(source) == 0:
-                    raise ValueError(f"Training dataset '{name}' (split '{split}') tokenized to 0 examples.")
+                    raise ValueError(
+                        f"Training dataset '{name}' (split '{split}') tokenized to 0 examples."
+                    )
                 sources.append(TextDataset(source))
         if len(sources) == 1:
             return sources[0]
-        per_dataset = ", ".join(f"{name}={len(source)}" for name, source in zip(source_names, sources))
+        per_dataset = ", ".join(
+            f"{name}={len(source)}" for name, source in zip(source_names, sources)
+        )
         logger.info(f"Concatenated {len(sources)} training datasets: {per_dataset}")
         return ConcatSFTDataset(sources)
 
@@ -1325,13 +1422,18 @@ class SFTTrainer:
         if self.sft_cfg.eval_pretokenized_dataset_paths:
             return [
                 (name, load_from_pretokenized(path, max_length=self.sft_cfg.max_length))
-                for name, path in zip(self.sft_cfg.eval_dataset_names, self.sft_cfg.eval_pretokenized_dataset_paths)
+                for name, path in zip(
+                    self.sft_cfg.eval_dataset_names,
+                    self.sft_cfg.eval_pretokenized_dataset_paths,
+                )
             ]
         if not self.sft_cfg.eval_datasets:
             return None
         eval_sets: list[tuple[str, list]] = []
         for name, dataset, split in zip(
-            self.sft_cfg.eval_dataset_names, self.sft_cfg.eval_datasets, self.sft_cfg.eval_dataset_splits
+            self.sft_cfg.eval_dataset_names,
+            self.sft_cfg.eval_datasets,
+            self.sft_cfg.eval_dataset_splits,
         ):
             eval_tokenized = self._load_and_tokenize(dataset, split)
             if len(eval_tokenized) == 0:
@@ -1421,7 +1523,10 @@ class SFTTrainer:
             import_sampler_class,
         )
 
-        multi_dataset = isinstance(tokenized, ConcatSFTDataset) and len(tokenized.dataset_lengths) > 1
+        multi_dataset = (
+            isinstance(tokenized, ConcatSFTDataset)
+            and len(tokenized.dataset_lengths) > 1
+        )
         dataset_lengths = tokenized.dataset_lengths if multi_dataset else None
         sampler_type = self.sft_cfg.sampler
         if sampler_type == "random":
@@ -1439,14 +1544,18 @@ class SFTTrainer:
             return StatefulSequentialSampler(tokenized)
         if sampler_type == "custom":
             if not self.sft_cfg.sampler_class_path:
-                raise ValueError("sampler='custom' requires sampler_class_path to be set.")
+                raise ValueError(
+                    "sampler='custom' requires sampler_class_path to be set."
+                )
             sampler_cls = import_sampler_class(self.sft_cfg.sampler_class_path)
             sampler_kwargs = self.sft_cfg.sampler_kwargs
             if multi_dataset:
                 # User-provided kwargs win over the injected lengths.
                 sampler_kwargs = {"lengths": dataset_lengths, **sampler_kwargs}
             return sampler_cls(tokenized, **sampler_kwargs)
-        raise ValueError(f"Unknown sampler '{sampler_type}'. Must be one of 'random', 'sequential', 'custom'.")
+        raise ValueError(
+            f"Unknown sampler '{sampler_type}'. Must be one of 'random', 'sequential', 'custom'."
+        )
 
     def build_train_dataloader(self, tokenized) -> StatefulDataLoader:
         """Build the training ``StatefulDataLoader``.
@@ -1496,7 +1605,8 @@ class SFTTrainer:
             drop_last=False,
             generator=seeded_generator,
             num_workers=num_workers,
-            persistent_workers=self.sft_cfg.dataloader_persistent_workers and num_workers > 0,
+            persistent_workers=self.sft_cfg.dataloader_persistent_workers
+            and num_workers > 0,
             multiprocessing_context="spawn" if num_workers > 0 else None,
         )
 
@@ -1523,7 +1633,8 @@ class SFTTrainer:
             collate_fn=collate_fn,
             drop_last=False,
             num_workers=num_workers,
-            persistent_workers=self.sft_cfg.dataloader_persistent_workers and num_workers > 0,
+            persistent_workers=self.sft_cfg.dataloader_persistent_workers
+            and num_workers > 0,
             multiprocessing_context="spawn" if num_workers > 0 else None,
         )
 
@@ -1548,15 +1659,21 @@ class SFTTrainer:
 
         if resume_from == "latest":
             if not self.sft_cfg.ckpt_path:
-                logger.info("resume_from='latest' but ckpt_path is empty, starting from scratch")
+                logger.info(
+                    "resume_from='latest' but ckpt_path is empty, starting from scratch"
+                )
                 return 0
-            latest_file = os.path.join(self.sft_cfg.ckpt_path, "latest_ckpt_global_step.txt")
+            latest_file = os.path.join(
+                self.sft_cfg.ckpt_path, "latest_ckpt_global_step.txt"
+            )
             if not io.exists(latest_file):
                 logger.info("No latest checkpoint marker found, starting from scratch")
                 return 0
             with io.open_file(latest_file, "r") as f:
                 ckpt_step = int(f.read().strip())
-            checkpoint_path = os.path.join(self.sft_cfg.ckpt_path, f"{GLOBAL_STEP_PREFIX}{ckpt_step}")
+            checkpoint_path = os.path.join(
+                self.sft_cfg.ckpt_path, f"{GLOBAL_STEP_PREFIX}{ckpt_step}"
+            )
             # Validate consistency: ensure no stale checkpoint folders from prior runs
             validate_consistency_for_latest_checkpoint(
                 self.sft_cfg.ckpt_path,
@@ -1610,7 +1727,9 @@ class SFTTrainer:
         if io.exists(dataloader_state_path):
             try:
                 with io.open_file(dataloader_state_path, "rb") as f:
-                    dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
+                    dataloader_state = torch.load(
+                        f, map_location="cpu", weights_only=False
+                    )
                 self.train_dataloader.load_state_dict(dataloader_state)
                 logger.info("Restored train dataloader state")
             except Exception as e:
@@ -1654,7 +1773,9 @@ class SFTTrainer:
             eval_loss, num_eval_batches = self._run_eval_one(eval_dataloader)
             metrics[f"{name}/loss"] = eval_loss
             total_eval_batches += num_eval_batches
-            logger.info(f"Eval dataset '{name}': loss={eval_loss:.4f} over {num_eval_batches} batches")
+            logger.info(
+                f"Eval dataset '{name}': loss={eval_loss:.4f} over {num_eval_batches} batches"
+            )
         return metrics, total_eval_batches
 
     def _run_eval_one(self, eval_dataloader: StatefulDataLoader) -> tuple[float, int]:
@@ -1757,7 +1878,9 @@ class SFTTrainer:
     def _validate_batch_parallelism(self):
         """Validate that batch_size is compatible with data-parallel and micro-batch sizes."""
         batch_size = self.sft_cfg.batch_size
-        total_gpus = self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        total_gpus = (
+            self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        )
         if self.sft_cfg.use_sequence_packing:
             # With packing, batch_size is the *example* count (not bins) and the
             # per-DP-rank bin count == bins_per_shard. The worker micro batch
@@ -1776,14 +1899,14 @@ class SFTTrainer:
                 )
             return
         if self.sft_cfg.strategy == "megatron":
-            tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
-            pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
-            dp_size = total_gpus // (tp * pp)
+            dp_size = self._dp_size()
         else:
             # FSDP: all GPUs are data-parallel
             dp_size = total_gpus
         if batch_size % dp_size != 0:
-            raise ValueError(f"batch_size ({batch_size}) must be divisible by data-parallel size ({dp_size})")
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by data-parallel size ({dp_size})"
+            )
         per_dp_batch = batch_size // dp_size
         micro_batch = self.sft_cfg.micro_train_batch_size_per_gpu
         if per_dp_batch % micro_batch != 0:
@@ -1798,23 +1921,28 @@ class SFTTrainer:
         max_length = self.sft_cfg.max_length
         vocab_size = self.tokenizer.vocab_size
 
-        # num_actions is max_length - 1 because the autoregressive model
-        # produces log-probs for positions 1..T (predicting next token),
-        # so the first token has no corresponding log-prob.
-        num_actions = max_length - 1
+        # Same-position classifier: every token has a label. NTP SFT uses
+        # max_length - 1; keep that only when this dummy batch is reused for CE.
+        num_actions = max_length
 
-        sequences = torch.randint(0, vocab_size, (batch_size, max_length), dtype=torch.long)
+        sequences = torch.randint(
+            0, vocab_size, (batch_size, max_length), dtype=torch.long
+        )
         attention_mask = torch.ones(batch_size, max_length, dtype=torch.long)
         # All tokens are non-pad in the dummy batch, so total_nonpad = batch_size * num_actions.
         # Scaling = 1 / total_nonpad.
         total_nonpad = batch_size * num_actions
-        loss_mask = torch.ones(batch_size, num_actions, dtype=torch.float) / total_nonpad
+        loss_mask = (
+            torch.ones(batch_size, num_actions, dtype=torch.float) / total_nonpad
+        )
 
+        rewards = torch.randint(0, 2, (batch_size, max_length), dtype=torch.long)
         batch = TrainingInputBatch(
             {
                 "sequences": sequences,
                 "attention_mask": attention_mask,
                 "loss_mask": loss_mask,
+                "rewards": rewards,
             }
         )
         batch.metadata = {"response_length": num_actions}
@@ -1851,7 +1979,8 @@ class SFTTrainer:
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
                     "train/tokens_per_second": tokens_per_second,
-                    "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
+                    "train/tokens_per_second_per_gpu": tokens_per_second
+                    / self._num_training_gpus,
                     "train/actual_num_tokens": actual_num_tokens,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
@@ -1906,7 +2035,9 @@ class SFTTrainer:
         eval_datasets = self.load_eval_datasets()
         if eval_datasets is not None:
             for eval_name, eval_tokenized in eval_datasets:
-                logger.info(f"Eval dataset '{eval_name}' loaded: {len(eval_tokenized)} examples")
+                logger.info(
+                    f"Eval dataset '{eval_name}' loaded: {len(eval_tokenized)} examples"
+                )
 
         batch_size = self.sft_cfg.batch_size
 
@@ -1918,7 +2049,8 @@ class SFTTrainer:
         self.train_dataloader = self.build_train_dataloader(tokenized)
         if eval_datasets is not None:
             self.eval_dataloaders = [
-                (eval_name, self.build_eval_dataloader(eval_tokenized)) for eval_name, eval_tokenized in eval_datasets
+                (eval_name, self.build_eval_dataloader(eval_tokenized))
+                for eval_name, eval_tokenized in eval_datasets
             ]
 
         # Validate the invariant the training loop relies on: the dataloader must
@@ -1954,7 +2086,9 @@ class SFTTrainer:
         )
 
         if self.sft_cfg.max_training_steps is not None:
-            logger.info(f"Capping training at max_training_steps={self.sft_cfg.max_training_steps}")
+            logger.info(
+                f"Capping training at max_training_steps={self.sft_cfg.max_training_steps}"
+            )
 
         # Resume from checkpoint if configured. This also restores the train
         # dataloader's sampling position (when a data.pt is present), so the
@@ -1975,7 +2109,9 @@ class SFTTrainer:
         self._current_epoch = current_epoch
         self._training_control.reset()
 
-        logger.info(f"Starting SFT training for {num_steps} steps (batch_size={batch_size})...")
+        logger.info(
+            f"Starting value-model training for {num_steps} steps (batch_size={batch_size})..."
+        )
         if start_step > 0:
             logger.info(f"Resuming from step {start_step}")
 
@@ -2016,7 +2152,10 @@ class SFTTrainer:
 
         collate_ahead_enabled = self.sft_cfg.async_batch_collation
         async_collator: Optional[AsyncBatchCollator] = (
-            AsyncBatchCollator(lambda _step: next(data_iter, None), thread_name_prefix="sft-batch-collate")
+            AsyncBatchCollator(
+                lambda _step: next(data_iter, None),
+                thread_name_prefix="sft-batch-collate",
+            )
             if collate_ahead_enabled
             else None
         )
@@ -2031,11 +2170,13 @@ class SFTTrainer:
                 all_timings: dict[str, float] = {}
 
                 with Timer("step", all_timings):
-
                     # With async enabled, this is usually just the wait for an
                     # already-running collate. ``None`` marks epoch exhaustion.
                     with Timer("data_loading", all_timings):
-                        if async_collator is not None and async_collator.pending_step() == self.global_step:
+                        if (
+                            async_collator is not None
+                            and async_collator.pending_step() == self.global_step
+                        ):
                             batch = async_collator.get(self.global_step)
                             self._checkpoint_dataloader_state = None
                         else:
@@ -2053,7 +2194,9 @@ class SFTTrainer:
                         # Advancing the iterator in the worker moves the live
                         # dataloader state one batch ahead. Preserve the state after
                         # the current batch so checkpoints still resume exactly.
-                        self._checkpoint_dataloader_state = self.train_dataloader.state_dict()
+                        self._checkpoint_dataloader_state = (
+                            self.train_dataloader.state_dict()
+                        )
                         async_collator.submit(self.global_step + 1)
 
                     self._fire("on_step_start", batch=batch)
@@ -2078,7 +2221,8 @@ class SFTTrainer:
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
                     "train/tokens_per_second": tokens_per_second,
-                    "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
+                    "train/tokens_per_second_per_gpu": tokens_per_second
+                    / self._num_training_gpus,
                     "train/actual_num_tokens": actual_num_tokens,
                     "train/batch_padded_seq_len": batch_padded_seq_len,
                     "train/total_tokens_processed": self._total_tokens_processed,
@@ -2109,7 +2253,10 @@ class SFTTrainer:
                     self._fire("on_save", ckpt_path=ckpt_path)
 
                 # HF export at regular intervals
-                if self.sft_cfg.hf_save_interval > 0 and self.global_step % self.sft_cfg.hf_save_interval == 0:
+                if (
+                    self.sft_cfg.hf_save_interval > 0
+                    and self.global_step % self.sft_cfg.hf_save_interval == 0
+                ):
                     with Timer("save_hf_model", all_timings):
                         self.save_hf_model()
                     log_dict["timing/save_hf_model"] = all_timings["save_hf_model"]
@@ -2118,17 +2265,27 @@ class SFTTrainer:
                 num_eval_batches: int | None = None
                 # Eval fires at step N where N % eval_interval == 0 and N > 0, OR
                 # whenever a callback set ``control.should_evaluate``.
-                interval_eval = self.sft_cfg.eval_interval > 0 and self.global_step % self.sft_cfg.eval_interval == 0
+                interval_eval = (
+                    self.sft_cfg.eval_interval > 0
+                    and self.global_step % self.sft_cfg.eval_interval == 0
+                )
                 if self.eval_dataloaders is not None and (force_eval or interval_eval):
                     self._fire("on_eval_start")
                     with Timer("eval", all_timings):
                         eval_metrics, num_eval_batches = self.run_eval()
                     self._fire("on_eval_end", metrics=eval_metrics)
                     if eval_metrics:
-                        log_dict.update({f"eval/{k}": v for k, v in eval_metrics.items()})
+                        log_dict.update(
+                            {f"eval/{k}": v for k, v in eval_metrics.items()}
+                        )
                         log_dict["timing/eval"] = all_timings["eval"]
 
-                log_dict.update({"train/epoch": current_epoch, "train/global_step": self.global_step})
+                log_dict.update(
+                    {
+                        "train/epoch": current_epoch,
+                        "train/global_step": self.global_step,
+                    }
+                )
                 # Callbacks may mutate log_dict in place via on_log.
                 self._fire("on_log", logs=log_dict)
                 self.tracker.log(log_dict, step=self.global_step, commit=True)
@@ -2200,7 +2357,10 @@ class SFTTrainer:
         # bump is purely a wandb-step accounting concern, not real trainer
         # state.
         if self.eval_dataloaders is not None:
-            already_ran = self.sft_cfg.eval_interval > 0 and num_steps % self.sft_cfg.eval_interval == 0
+            already_ran = (
+                self.sft_cfg.eval_interval > 0
+                and num_steps % self.sft_cfg.eval_interval == 0
+            )
             if not already_ran:
                 final_eval_step = num_steps + 1
                 eval_timings: dict[str, float] = {}
@@ -2219,12 +2379,14 @@ class SFTTrainer:
                     )
 
         self._fire("on_train_end")
-        logger.info("SFT training complete!")
+        logger.info("Value-model training complete!")
 
     def save_checkpoint(self) -> str:
         """Save a checkpoint at the given step. Returns the checkpoint folder path."""
         step = self.global_step
-        global_step_folder = os.path.join(self.sft_cfg.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}")
+        global_step_folder = os.path.join(
+            self.sft_cfg.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}"
+        )
         policy_save_dir = os.path.join(global_step_folder, "policy")
         io.makedirs(global_step_folder, exist_ok=True)
         logger.info(f"Saving checkpoint at step {step} to {global_step_folder}")
@@ -2256,7 +2418,9 @@ class SFTTrainer:
         logger.info(f"Saved trainer state to {trainer_state_path}")
 
         # Atomic tracking -- write this last after all saves succeed
-        latest_file = os.path.join(self.sft_cfg.ckpt_path, "latest_ckpt_global_step.txt")
+        latest_file = os.path.join(
+            self.sft_cfg.ckpt_path, "latest_ckpt_global_step.txt"
+        )
         with io.open_file(latest_file, "w") as f:
             f.write(str(step))
         logger.info(f"Checkpoint saved for global_step_{step}")

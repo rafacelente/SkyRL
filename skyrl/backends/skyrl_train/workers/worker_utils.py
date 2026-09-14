@@ -1,8 +1,9 @@
 import math
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl.backends.skyrl_train.training_batch import TensorBatch, TrainingInputBatch
@@ -28,6 +29,33 @@ MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_P
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_MAX_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_max"
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_MIN_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_min"
 MINIBATCH_ROLLOUT_LOGPROB_DIFF_STD_KEY = f"{MINIBATCH_ROLLOUT_LOGPROB_DIFF_PREFIX}_std"
+
+
+def apply_freeze_modules(
+    module: Union[nn.Module, Sequence[nn.Module]],
+    patterns: Optional[Iterable[str]],
+) -> int:
+    """Freeze parameters whose name contains any of ``patterns``.
+
+    Applied before optimizer construction so Adam/DistributedOptimizer skip the
+    frozen tensors. Matching is a substring check on ``named_parameters()``
+    keys (Megatron: ``self_attention``, ``linear_qkv``; HF: ``self_attn``).
+
+    Returns the number of parameters whose ``requires_grad`` was set to False.
+    """
+    if not patterns:
+        return 0
+    patterns = [p for p in patterns if p]
+    if not patterns:
+        return 0
+    modules = module if isinstance(module, (list, tuple)) else [module]
+    frozen = 0
+    for mod in modules:
+        for name, param in mod.named_parameters():
+            if param.requires_grad and any(pat in name for pat in patterns):
+                param.requires_grad = False
+                frozen += 1
+    return frozen
 
 
 def get_inference_weight_prefix(is_multimodal_lm_only: bool) -> str:
@@ -174,6 +202,7 @@ class BaseBatchIterator:
             rollout_logprobs=batch.get("rollout_logprobs"),
             rollout_expert_indices=batch.get("rollout_expert_indices"),
             router_padding_mask=batch.get("router_padding_mask"),
+            rewards=batch.get("rewards"),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
             info={},

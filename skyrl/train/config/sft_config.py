@@ -280,6 +280,19 @@ class SFTConfig(BaseConfig):
     # ---- Training target ----
     train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_MESSAGE
     """Which tokens to compute loss on. See :class:`TrainOnWhat` for options."""
+    value_model_training: bool = False
+    """When True, train a token-level binary classifier instead of next-token prediction.
+    FSDP loads ``get_llm_for_sequence_regression`` with a 2-class head. Megatron
+    attaches a replicated ``value_head`` on the last PP stage and scores
+    same-position labels in ``rewards`` (DP/TP/CP compatible)."""
+    freeze_modules: Optional[List[str]] = None
+    """Parameter-name substrings to freeze before the optimizer is built.
+    Forwarded to ``trainer.policy.freeze_modules``. Examples:
+    ``['self_attn']`` (FSDP/HF) or ``['self_attention', 'linear_qkv']`` (Megatron)."""
+    language_model_only: bool = False
+    """Skip vision-encoder init for multimodal checkpoints (Qwen3.5). Required
+    for Megatron GPTModel + GDN packing on Qwen3.5-35B-A3B. Forwarded to
+    ``trainer.policy.language_model_only``."""
 
     # ---- Packing ----
     remove_microbatch_padding: bool = True  # Pack multiple sequences per microbatch (requires flash_attn)
@@ -658,6 +671,8 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     cfg.trainer.policy.use_torch_compile = sft_cfg.use_torch_compile
     cfg.trainer.policy.record_memory = sft_cfg.record_memory
     cfg.trainer.policy.torch_profiler_config = sft_cfg.torch_profiler_config
+    cfg.trainer.policy.freeze_modules = sft_cfg.freeze_modules
+    cfg.trainer.policy.language_model_only = sft_cfg.language_model_only
 
     # SFT doesn't use KL/ref model
     cfg.trainer.algorithm.use_kl_loss = False
@@ -669,6 +684,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     # to simplify user configuration
     cfg.trainer.micro_forward_batch_size_per_gpu = sft_cfg.micro_train_batch_size_per_gpu
     cfg.trainer.remove_microbatch_padding = sft_cfg.remove_microbatch_padding
+    cfg.trainer.value_model_training = sft_cfg.value_model_training
     # When sequence packing is on, each row in the dispatched batch is one bin
     # and one worker micro-batch, so the worker-side
     # ``micro_train_batch_size_per_gpu`` is 1 (the bin token budget is carried

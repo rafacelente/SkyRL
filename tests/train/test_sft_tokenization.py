@@ -283,6 +283,46 @@ def test_collate_loss_mask_alignment(tokenizer):
     assert batch["loss_mask"][2].tolist() == [0, 0, 1]
 
 
+def test_collate_reward_binary_same_position(tokenizer):
+    """Same-position labels are left-padded with sequences and keep class ids."""
+    examples = [
+        {**_make_example([1, 2, 3, 4, 5], 2), "reward_binary": [0, 1, 0, 1, 1]},
+        {**_make_example([10, 20, 30], 1), "reward_binary": 1},
+        {**_make_example([100, 200, 300, 400], 3), "reward_binary": [1, 0, 1]},
+    ]
+    batch = collate_sft_batch(examples, tokenizer)
+    pad_id = tokenizer.pad_token_id
+
+    assert batch["rewards"].shape == (3, 5)
+    assert batch["rewards"][0].tolist() == [0, 1, 0, 1, 1]
+    # Scalar label is broadcast onto real tokens; left pad stays 0.
+    assert batch["sequences"][1].tolist() == [pad_id, pad_id, 10, 20, 30]
+    assert batch["rewards"][1].tolist() == [0, 0, 1, 1, 1]
+    # Response-window labels land on the last num_actions tokens of the example.
+    assert batch["rewards"][2].tolist() == [0, 0, 1, 0, 1]
+
+
+def test_default_collator_preserves_rewards(tokenizer):
+    """DefaultCollator keeps rewards and still normalizes the loss mask."""
+    from skyrl.train.dataset.collators import DefaultCollator
+    from skyrl.train.value_model_trainer import collate_sft_batch as collate_value_batch
+
+    examples = [
+        {**_make_example([1, 2, 3, 4, 5], 2), "reward_binary": [0, 1, 0, 1, 1]},
+        {**_make_example([10, 20, 30], 1), "reward_binary": 1},
+    ]
+    collator = DefaultCollator(
+        tokenizer,
+        micro_train_batch_size_per_gpu=2,
+        collate_fn=collate_value_batch,
+    )
+    batch = collator(examples, batch_size=2)
+
+    assert "rewards" in batch
+    assert batch["rewards"][0].tolist() == [0, 1, 0, 1, 1]
+    assert abs(batch["loss_mask"].sum().item() - 1.0) < 1e-5
+
+
 def test_collate_single_example(tokenizer):
     """Batch of one: no padding needed."""
     examples = [_make_example([1, 2, 3], 2)]

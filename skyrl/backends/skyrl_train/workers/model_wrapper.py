@@ -79,6 +79,7 @@ class HFModelWrapper(nn.Module):
         meta_init: bool = False,
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
+        value_model_training: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -87,12 +88,39 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
+        self.value_model_training = value_model_training
         if remove_microbatch_padding:
             assert (
                 self.attn_implementation == "flash_attention_2"
             ), "Flash attention 2 should be used for `remove_microbatch_padding`"
 
-        if isinstance(pretrain_or_model, str):
+        if value_model_training:
+            if isinstance(pretrain_or_model, str):
+                logger.info(
+                    "[VALUE MODEL TRAINING] Loading a token-level classifier via get_llm_for_sequence_regression"
+                )
+                self.model = get_llm_for_sequence_regression(
+                    pretrain_or_model,
+                    "critic",
+                    bf16=bf16,
+                    load_in_4bit=load_in_4bit,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    target_modules=target_modules,
+                    exclude_modules=exclude_modules,
+                    lora_dropout=lora_dropout,
+                    use_flash_attention_2=use_flash_attention_2,
+                    init_value_head=True,
+                    device_map=device_map,
+                    sequence_parallel_size=sequence_parallel_size,
+                    remove_microbatch_padding=remove_microbatch_padding,
+                    model_config_kwargs=model_config_kwargs,
+                    meta_init=meta_init,
+                    num_labels=2,
+                )
+            else:
+                self.model = pretrain_or_model
+        elif isinstance(pretrain_or_model, str):
             if load_in_4bit:
                 assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
                 nf4_config = BitsAndBytesConfig(
@@ -250,8 +278,21 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        rewards: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
+        if self.value_model_training:
+            return self._forward_value_model(
+                sequences=sequences,
+                num_actions=num_actions,
+                attention_mask=attention_mask,
+                temperature=temperature,
+                return_output=return_output,
+                compute_entropy=compute_entropy,
+                entropy_requires_grad=entropy_requires_grad,
+                rewards=rewards,
+            )
+
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -397,6 +438,60 @@ class HFModelWrapper(nn.Module):
         else:
             return action_log_probs
 
+    def _forward_value_model(
+        self,
+        sequences: torch.LongTensor,
+        num_actions: Union[int, list[int]],
+        attention_mask: Optional[torch.Tensor],
+        temperature: float,
+        return_output: bool,
+        compute_entropy: bool,
+        entropy_requires_grad: bool,
+        rewards: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Same-position binary classification over the response window.
+
+        ``self.model`` is the critic from ``get_llm_for_sequence_regression``
+        (backbone + 2-class head). Packing / sequence-parallel are handled there.
+        ``rewards`` are integer class ids, either ``[B, S]`` (full sequence,
+        left-padded like ``sequences``) or ``[B, A]`` (response window).
+        """
+        if rewards is None:
+            raise ValueError("value_model_training requires integer class labels in `rewards`")
+
+        if isinstance(num_actions, list):
+            if len(num_actions) == 1:
+                num_actions = num_actions[0]
+            else:
+                num_actions = np.array(num_actions)
+
+        action_logits, output = self.model(
+            input_ids=sequences,
+            num_actions=num_actions,
+            attention_mask=attention_mask,
+            return_output=True,
+        )
+        if temperature is not None and temperature != 1.0:
+            action_logits = action_logits / temperature
+
+        labels = rewards.long()
+        if labels.dim() == 2 and labels.shape[-1] == sequences.shape[-1]:
+            labels = labels[:, -num_actions:]
+
+        log_probs = logprobs_from_logits(action_logits, labels, inplace_backward=True)
+
+        if compute_entropy:
+            output["entropy"] = self.chunked_entropy_from_logits_fn(
+                action_logits,
+                requires_grad=entropy_requires_grad,
+                attention_mask=None,
+                chunk_size=self.logprobs_chunk_size,
+            )
+
+        if return_output:
+            return (log_probs, output)
+        return log_probs
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={"use_reentrant": False}):
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
@@ -410,6 +505,7 @@ def _get_critic_model(
     value_head_prefix="value_head",
     sequence_parallel_size=1,
     remove_microbatch_padding: bool = False,
+    num_labels: int = 1,
 ):
     class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
@@ -419,7 +515,8 @@ def _get_critic_model(
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
             self.value_head_prefix = value_head_prefix
-            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+            self.num_labels = num_labels
+            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, num_labels, bias=False))
 
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
@@ -493,16 +590,21 @@ def _get_critic_model(
             if self.remove_microbatch_padding:
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
-                # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
+                # (1, nnz, C) -> (nnz, C) -> (batch_size, seqlen, C)
                 values_BSH = pad_input(values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
-
-            values = values_BSH.squeeze(-1)[:, :-1]
 
             if num_actions is None:
                 assert return_output
                 return outputs
 
-            action_values = values[:, -num_actions:]
+            if self.num_labels == 1:
+                # RL critic: drop the last hidden state (NTP-aligned values), then
+                # take the response window. Output is [B, A].
+                action_values = values_BSH.squeeze(-1)[:, :-1][:, -num_actions:]
+            else:
+                # Token-level classifier: same-position logits at every token,
+                # including the last. Output is [B, A, C].
+                action_values = values_BSH[:, -num_actions:]
 
             if return_output:
                 return (action_values, outputs)
@@ -533,6 +635,7 @@ def get_llm_for_sequence_regression(
     remove_microbatch_padding: bool = False,
     model_config_kwargs: dict = {},
     meta_init: bool = False,
+    num_labels: int = 1,
     **kwargs,
 ) -> nn.Module:
     """Get transformer with a sequence classification head on top (linear layer).
@@ -542,6 +645,8 @@ def get_llm_for_sequence_regression(
         model_type (str): Type of sequence classification model. Only `critic` is supported.
         bf16 (bool, optional): Whether enable bfloat16. Defaults to True.
         use_flash_attention_2 (bool, optional): Whether use Flash Attention 2.0. Defaults to False.
+        num_labels (int, optional): Value-head output size. ``1`` is the RL critic
+            (scalar values). ``2`` is a same-position binary classifier.
 
     Returns:
         nn.Module: pretrained transformer model.
@@ -559,6 +664,7 @@ def get_llm_for_sequence_regression(
         value_head_prefix,
         sequence_parallel_size=sequence_parallel_size,
         remove_microbatch_padding=remove_microbatch_padding,
+        num_labels=num_labels,
     )
 
     if load_in_4bit:
@@ -628,7 +734,7 @@ def get_llm_for_sequence_regression(
 
     # NOTE: For reward model training only, intialize value_head manually.
     # TODO: Find a better way to clarify reward model training.
-    if init_value_head:
+    if init_value_head and not meta_init:
         value_head = getattr(model, value_head_prefix)
         value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
 

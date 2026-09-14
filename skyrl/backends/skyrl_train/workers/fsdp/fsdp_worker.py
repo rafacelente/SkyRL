@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import ray
 import torch
 import torch.distributed
+from loguru import logger
 from transformers import AutoConfig
 
 try:
@@ -179,8 +180,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            value_model_training=self.cfg.value_model_training,
         )
-        self._seq_parallel_monkey_patch(model=wrapped_model.model)
+        self._seq_parallel_monkey_patch(model=wrapped_model.model, use_parent_class=self.cfg.value_model_training)
+
+        if self.cfg.policy.freeze_modules:
+            from skyrl.backends.skyrl_train.workers.worker_utils import apply_freeze_modules
+
+            frozen = apply_freeze_modules(wrapped_model, self.cfg.policy.freeze_modules)
+            logger.info(f"freeze_modules={list(self.cfg.policy.freeze_modules)}: froze {frozen} parameter(s)")
 
         if self.cfg.gradient_checkpointing:
             wrapped_model.gradient_checkpointing_enable(

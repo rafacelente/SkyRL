@@ -1008,6 +1008,7 @@ class PolicyWorkerBase(Worker):
         loss_mask = experience.loss_mask
         response_mask = experience.response_mask
         rollout_action_logprobs = experience.rollout_logprobs
+        rewards = experience.rewards
 
         # Determine which loss function to use
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
@@ -1042,6 +1043,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                rewards=rewards,
             )
             # loss function
             # TODO: recompute advantages
@@ -1317,6 +1319,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=False,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                rewards=experience.rewards,
             )
             policy_loss, _ = current_loss_fn(
                 action_log_probs,

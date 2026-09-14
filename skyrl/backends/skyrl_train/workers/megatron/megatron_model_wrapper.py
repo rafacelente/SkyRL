@@ -38,6 +38,11 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
 from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     build_token_metadata_layout,
 )
+from skyrl.backends.skyrl_train.distributed.megatron.value_head import (
+    align_reward_labels,
+    value_head_logprobs_packed,
+    value_head_logprobs_unpacked,
+)
 from skyrl.backends.skyrl_train.mtp.adapter import project_mtp_hidden_to_logits
 from skyrl.backends.skyrl_train.mtp.hidden_capture import maybe_capture_mtp_hidden
 from skyrl.backends.skyrl_train.mtp.soft_ce import (
@@ -173,6 +178,21 @@ class MegatronModelWrapper:
         # [B, S, vocab//TP] logits + its fp32 grad). See model_utils.
         self._fused_lm_head = bool(getattr(self.cfg, "fused_lm_head_logprob", False))
         self._fused_lm_head_backend = getattr(self.cfg, "fused_lm_head_logprob_backend", "torch")
+        self._value_model_training = bool(getattr(self.cfg, "value_model_training", False))
+        self._value_head = None
+        if self._value_model_training:
+            from megatron.core.utils import unwrap_model
+
+            for chunk in self.actor_module:
+                unwrapped = unwrap_model(chunk)
+                if hasattr(unwrapped, "value_head"):
+                    self._value_head = unwrapped.value_head
+                    break
+            if self._value_head is None and mpu.is_pipeline_last_stage(ignore_virtual=True):
+                raise RuntimeError(
+                    "value_model_training=True but no value_head was attached on the last "
+                    "pipeline stage. attach_value_head must run as a pre-wrap hook."
+                )
         # Some models (e.g. Qwen3.5 via the VL bridge -> Qwen3VLModel) pack
         # sequences inside their own forward; SkyRL sample packing would then
         # double-pack and corrupt the GDN cu_seqlens, so refuse it. For Qwen3.5,
@@ -509,6 +529,38 @@ class MegatronModelWrapper:
             log_probs = torch.zeros(size=(1, 1), dtype=torch.bfloat16, device=device)
         return log_probs
 
+    def _value_model_token_logprobs(
+        self,
+        hidden: torch.Tensor,
+        data: dict,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Same-position 2-class log-probs over the full sequence, shape ``[B, S]``."""
+        if self._value_head is None:
+            raise RuntimeError("value_model_training requires a value_head on the last PP stage")
+        if data.get("rewards") is None:
+            raise ValueError("value_model_training requires integer class labels in `rewards`")
+        packed_seq_params = data.get("packed_seq_params")
+        if packed_seq_params is not None:
+            packed_labels = data.get("packed_labels")
+            if packed_labels is None:
+                raise ValueError("packed value-model path requires packed_labels")
+            return value_head_logprobs_packed(
+                hidden,
+                self._value_head,
+                packed_labels,
+                packed_seq_params.cu_seqlens_q_padded,
+                data["sequences"].shape[1],
+                attention_mask=data["attention_mask"],
+                sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                cp_group=mpu.get_context_parallel_group(),
+                temperature=temperature,
+            )
+        labels = data.get("reward_labels")
+        if labels is None:
+            labels = align_reward_labels(data["rewards"], data["sequences"])
+        return value_head_logprobs_unpacked(hidden, self._value_head, labels, temperature=temperature)
+
     def forward_backward_mini_batch(
         self,
         micro_batches: List[dict],
@@ -554,7 +606,11 @@ class MegatronModelWrapper:
         # native MTP gradient couples onto the trunk. A forward hook captures the heads' hidden states
         # (with the trunk input detached) for us to score. Training only.
         model_config = get_model_config(self.actor_module[0])
-        mtp_enabled = (not forward_only) and bool(getattr(model_config, "mtp_num_layers", None))
+        mtp_enabled = (
+            (not forward_only)
+            and (not self._value_model_training)
+            and bool(getattr(model_config, "mtp_num_layers", None))
+        )
         # Defaults live on the MegatronConfig dataclass (config.py) -- read the fields directly
         # rather than restating them in getattr fallbacks that could drift.
         mcfg = self.cfg.policy.megatron_config
@@ -607,6 +663,62 @@ class MegatronModelWrapper:
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
             tp_grp = mpu.get_tensor_model_parallel_group()
             tp_rank = mpu.get_tensor_model_parallel_rank()
+
+            if self._value_model_training:
+                token_logprobs = self._value_model_token_logprobs(logits, data, temperature)
+                action_log_probs = token_logprobs[:, -num_actions:]
+                policy_loss, loss_metrics = current_loss_fn(
+                    action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    config=loss_config,
+                    loss_mask=loss_mask,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
+                if resolved_loss_name != "cross_entropy":
+                    raise ValueError(
+                        "value_model_training only supports loss_fn='cross_entropy', "
+                        f"got {resolved_loss_name!r}"
+                    )
+                grad_sum_correction_factor = num_microbatches * dp_size
+                loss = policy_loss * grad_sum_correction_factor
+                unscaled_loss = policy_loss
+                if return_per_token_outputs:
+                    with torch.no_grad():
+                        elementwise_loss = -action_log_probs
+                        if loss_mask is not None:
+                            elementwise_loss = elementwise_loss * loss_mask
+                    batch_size = action_log_probs.shape[0]
+                    seq_len = action_log_probs.shape[1]
+                    if response_mask is not None:
+                        valid_lens_t = response_mask.sum(dim=-1).long()
+                    elif loss_mask is not None:
+                        valid_lens_t = (loss_mask > 0).sum(dim=-1).long()
+                    else:
+                        valid_lens_t = torch.full(
+                            (batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long
+                        )
+                    action_log_probs_cpu = action_log_probs.detach().cpu()
+                    elementwise_loss_cpu = elementwise_loss.detach().cpu()
+                    valid_lens = valid_lens_t.cpu().tolist()
+                    loss_fn_outputs = []
+                    for i in range(batch_size):
+                        valid_len = valid_lens[i]
+                        loss_fn_outputs.append(
+                            {
+                                "logprobs": (action_log_probs_cpu[i, -valid_len:].tolist() if valid_len > 0 else []),
+                                "elementwise_loss": (
+                                    elementwise_loss_cpu[i, -valid_len:].tolist() if valid_len > 0 else []
+                                ),
+                            }
+                        )
+                else:
+                    loss_fn_outputs = [{} for _ in range(action_log_probs.shape[0])]
+                return loss, {
+                    "loss": unscaled_loss.detach().item(),
+                    "response_length": num_actions,
+                    "loss_fn_outputs": loss_fn_outputs,
+                }
 
             # Fused LM-head: `logits` is actually decoder hidden states [B, S, H]
             # (the output_processor skipped the projection); fold the LM-head into
@@ -1044,6 +1156,18 @@ class MegatronModelWrapper:
                 if self.is_vlm:
                     new_position_ids = None
 
+            if self._value_model_training:
+                rewards = batch.get("rewards")
+                if rewards is None:
+                    raise ValueError("value_model_training requires integer class labels in `rewards`")
+                aligned_labels = align_reward_labels(rewards, sequences)
+                if packed_seq_params is not None:
+                    batch["packed_labels"] = _build_packed_targets(
+                        aligned_labels, attention_mask, packed_seq_params, sub_seq_lengths=sub_seq_lengths
+                    )
+                else:
+                    batch["reward_labels"] = aligned_labels
+
             is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
 
             metadata_layout = None
@@ -1109,9 +1233,10 @@ class MegatronModelWrapper:
             student_hidden = None
             student_model = None
             with maybe_capture_mtp_hidden(model, mtp_enabled) as capture:
-                if self._fused_lm_head:
+                if self._fused_lm_head or self._value_model_training:
                     # output_processor returns decoder hidden states (not logits) and
                     # stashes the LM-head weight; loss_func then fuses the projection.
+                    # Value-model training always skips the vocab-parallel LM head.
                     _op_ctx: dict = {}
                     outputs = call_model_with_fused_lm_head(
                         model,

@@ -38,6 +38,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_moe_metrics,
     print_model_size,
 )
+from skyrl.backends.skyrl_train.distributed.megatron.value_head import attach_value_head
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
@@ -105,6 +106,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     BatchIterator,
     TokenBasedBatchIterator,
     all_reduce_metrics,
+    apply_freeze_modules,
     get_microbatch_iterator,
     reduce_metrics,
 )
@@ -806,6 +808,21 @@ class MegatronWorker:
 
             self.provider.register_pre_wrap_hook(lora_pre_wrap_hook)
 
+        # After LoRA so the 2-class head is not wrapped as an adapter, and so
+        # freeze_modules can still match LoRA params under a frozen name.
+        if getattr(self.cfg, "value_model_training", False):
+            self.provider.register_pre_wrap_hook(attach_value_head)
+        if self.cfg.policy.freeze_modules:
+            patterns = list(self.cfg.policy.freeze_modules)
+
+            def freeze_modules_hook(model):
+                frozen = apply_freeze_modules(model, patterns)
+                if self._rank == 0:
+                    logger.info(f"freeze_modules={patterns}: froze {frozen} parameter(s)")
+                return model
+
+            self.provider.register_pre_wrap_hook(freeze_modules_hook)
+
         default_ddp_config = DistributedDataParallelConfig()
         if wrap_with_ddp:
             default_ddp_config.use_distributed_optimizer = True
@@ -1270,6 +1287,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
                     "router_padding_mask": experience.router_padding_mask if self.enable_router_replay else None,
                     "sub_seq_lengths": experience.sub_seq_lengths,
+                    "rewards": experience.rewards,
                     **vlm_inputs,
                 }
             )
@@ -1396,6 +1414,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "router_padding_mask": experience.router_padding_mask if self.enable_router_replay else None,
                     # used with global sequence packing (None when token-based batching is active)
                     "sub_seq_lengths": experience.sub_seq_lengths,
+                    "rewards": experience.rewards,
                     "is_padding_batch": (
                         experience.metadata.get("is_padding_batch", False) if experience.metadata else False
                     ),

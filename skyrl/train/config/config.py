@@ -691,6 +691,12 @@ class PolicyConfig(BaseConfig):
     language_model_only: bool = False
     """When True, skip vision encoder initialization for multimodal models (e.g. Qwen3.5).
     Loads only the language model backbone using AutoModelForCausalLM."""
+    freeze_modules: Optional[List[str]] = None
+    """Parameter-name substrings to freeze (``requires_grad=False``) before the
+    optimizer is built. A parameter is frozen when any string appears in its
+    ``named_parameters()`` key. Typical attention patterns: ``self_attention`` /
+    ``linear_qkv`` (Megatron) and ``self_attn`` (HuggingFace). Applied after
+    LoRA wrap so adapters under a matching name are also frozen."""
     inference_only_init: bool = False
     """When True, set up the policy worker for inference-only flows (forward + weight
     sync, no train_step), skipping the training-only state that would otherwise OOM
@@ -1586,6 +1592,9 @@ class TrainerConfig(BaseConfig):
     """Fused LM-head backend: ``"torch"`` (default) or ``"triton"``.
     The Triton backend requires CUDA + triton and falls back to ``"torch"``
     when unavailable. Ignored unless ``fused_lm_head_logprob`` is true."""
+    value_model_training: bool = False
+    """When True, the policy worker loads a token-level classification head instead of a causal LM head.
+    Labels are same-position integer class ids carried in ``rewards``."""
 
     def __post_init__(self):
         # ref model defaults to the policy model

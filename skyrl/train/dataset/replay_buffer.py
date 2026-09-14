@@ -71,6 +71,7 @@ class Experience:
     num_actions: int
     info: Optional[dict]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None
+    rewards: Optional[Integer[torch.Tensor, "batch seq_len"]] = None
     kl: Optional[Float[torch.Tensor, "batch response_len"]] = None
     metadata: Optional[Dict[str, Any]] = None
     pixel_values: Optional[TensorList] = None
@@ -110,6 +111,8 @@ class Experience:
             self.image_grid_thw = self.image_grid_thw.to(device)
         if self.sub_seq_lengths is not None:
             self.sub_seq_lengths = self.sub_seq_lengths.to(device)
+        if self.rewards is not None:
+            self.rewards = to(self.rewards, device)
 
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)
@@ -135,6 +138,8 @@ class Experience:
             self.rollout_expert_indices = self.rollout_expert_indices.pin_memory()
         if self.router_padding_mask is not None:
             self.router_padding_mask = self.router_padding_mask.pin_memory()
+        if self.rewards is not None:
+            self.rewards = self.rewards.pin_memory()
         return self
 
 

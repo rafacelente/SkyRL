@@ -18,7 +18,7 @@ function for the un-packed layout.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -40,11 +40,21 @@ class DefaultCollator:
     loss metrics are summed across micro-batches and DP ranks: the scale is
     ``1 / total_nonpad`` where ``total_nonpad`` is the count of
     loss-contributing tokens in the batch.
+
+    ``collate_fn`` defaults to :func:`skyrl.train.sft_trainer.collate_sft_batch`.
+    Value-model training passes its own collate so ``reward_binary`` is required
+    and written onto the batch as ``rewards``.
     """
 
-    def __init__(self, tokenizer, micro_train_batch_size_per_gpu: int):
+    def __init__(
+        self,
+        tokenizer,
+        micro_train_batch_size_per_gpu: int,
+        collate_fn: Optional[Callable] = None,
+    ):
         self.tokenizer = tokenizer
         self.micro_train_batch_size_per_gpu = micro_train_batch_size_per_gpu
+        self.collate_fn = collate_fn
 
     def __call__(self, examples: list, batch_size: int) -> TrainingInputBatch:
         """Collate ``examples`` and scale the loss mask.
@@ -55,11 +65,15 @@ class DefaultCollator:
                 interface. The default layout normalizes by the realized token
                 count in ``examples``.
         """
-        # Imported lazily to avoid a circular import: ``sft_trainer`` imports
-        # this module to select a collator at construction time.
-        from skyrl.train.sft_trainer import collate_sft_batch
+        collate_fn = self.collate_fn
+        if collate_fn is None:
+            # Imported lazily to avoid a circular import: ``sft_trainer`` imports
+            # this module to select a collator at construction time.
+            from skyrl.train.sft_trainer import collate_sft_batch
 
-        batch = collate_sft_batch(examples, self.tokenizer)
+            collate_fn = collate_sft_batch
+
+        batch = collate_fn(examples, self.tokenizer)
         total_nonpad = max(batch["loss_mask"].sum().item(), 1)
         batch["loss_mask"] = batch["loss_mask"].float() / total_nonpad
         return batch

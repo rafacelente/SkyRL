@@ -213,6 +213,30 @@ class TestLoraConfigOverrides:
         assert skyrl_cfg.trainer.policy.model.lora.rank == 0
 
 
+class TestFreezeAndLanguageModelOnlyOverrides:
+    """freeze_modules and language_model_only bridge to policy config."""
+
+    def test_freeze_modules_propagate(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "model.path=test/my-model",
+                "freeze_modules=['self_attention','self_attn']",
+            ]
+        )
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.policy.freeze_modules == ["self_attention", "self_attn"]
+
+    def test_language_model_only_propagates(self):
+        cfg = _sft_cfg_from_overrides(["model.path=test/my-model", "language_model_only=true"])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.policy.language_model_only is True
+
+    def test_value_model_training_propagates(self):
+        cfg = _sft_cfg_from_overrides(["model.path=test/my-model", "value_model_training=true"])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.value_model_training is True
+
+
 class TestTorchProfilerConfigOverrides:
     """SFT profiler config bridge coverage."""
 
