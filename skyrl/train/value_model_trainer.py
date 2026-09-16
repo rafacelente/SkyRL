@@ -1770,15 +1770,16 @@ class ValueModelTrainer:
         metrics: dict[str, float] = {}
         total_eval_batches = 0
         for name, eval_dataloader in self.eval_dataloaders:
-            eval_loss, num_eval_batches = self._run_eval_one(eval_dataloader)
-            metrics[f"{name}/loss"] = eval_loss
+            eval_stats, num_eval_batches = self._run_eval_one(eval_dataloader)
+            for key, value in eval_stats.items():
+                metrics[f"{name}/{key}"] = value
             total_eval_batches += num_eval_batches
             logger.info(
-                f"Eval dataset '{name}': loss={eval_loss:.4f} over {num_eval_batches} batches"
+                f"Eval dataset '{name}': {_format_eval_metrics(eval_stats)} over {num_eval_batches} batches"
             )
         return metrics, total_eval_batches
 
-    def _run_eval_one(self, eval_dataloader: StatefulDataLoader) -> tuple[float, int]:
+    def _run_eval_one(self, eval_dataloader: StatefulDataLoader) -> tuple[dict[str, float], int]:
         """Compute eval loss over one eval dataset.
 
         Iterates the dataloader (chunks of ``micro_train_batch_size_per_gpu * dp_size``,
@@ -1791,8 +1792,20 @@ class ValueModelTrainer:
         which are themselves per-non-pad-token means within each batch. This
         yields the true per-non-pad-token mean across the eval dataset.
 
+        Besides the token-weighted ``loss``, value-model eval reports
+        classifier diagnostics computed from the per-token label log-probs:
+
+        - ``last_tok_ce``: mean CE at the final supervised token of each sequence
+          (the position that has seen the whole trajectory).
+        - ``seq_acc``: fraction of sequences whose final supervised token puts
+          ``p(label) > 0.5``.
+        - ``token_acc``: fraction of supervised tokens with ``p(label) > 0.5``.
+        - ``seq_acc_mean``: fraction of sequences whose mean token CE is below
+          ``ln 2`` (geometric-mean ``p(label) > 0.5``); a majority-class collapse
+          shows up here as exactly the class prior.
+
         Returns:
-            ``(eval_loss, num_eval_batches)``.
+            ``(metrics, num_eval_batches)``.
         """
         # The dataloader yields one chunk per DP rank's micro-batch; the final
         # (possibly short) chunk is padded below up to the full chunk size.
@@ -1807,8 +1820,18 @@ class ValueModelTrainer:
         total_loss_weighted = 0.0
         total_tokens = 0
         num_eval_batches = 0
+        ln2 = float(np.log(2.0))
+        last_tok_ce_sum = 0.0
+        seq_correct = 0
+        seq_mean_correct = 0
+        tok_correct = 0
+        tok_total = 0
+        num_seqs = 0
         for batch in eval_dataloader:
             num_eval_batches += 1
+            # Recover the 0/1 supervision mask before row padding (padded rows
+            # have an all-zero mask and are skipped in the per-sequence stats).
+            supervised = (batch["loss_mask"] > 0).cpu().numpy()
             # Pad the last (possibly-short) chunk so every dispatch sees exactly
             # ``eval_chunk_size`` rows. ``pad_training_input_batch`` zeros the
             # ``loss_mask`` for padding rows; with ``pad_size=0`` it is a no-op.
@@ -1826,19 +1849,45 @@ class ValueModelTrainer:
             # was 0/1 before scaling. Recover the count from the batch by counting positive entries.
             # Padded rows have loss_mask=0 so they are excluded here.
             nonpad_tokens = int((batch["loss_mask"] > 0).sum().item())
-            # Eval consumes metrics only; skip per-token loss_fn_outputs.
+            # Per-token label log-probs are needed for the classifier diagnostics.
             output = self.dispatch.forward(
                 "policy",
                 batch,
                 loss_fn="cross_entropy",
-                return_per_token_outputs=False,
+                return_per_token_outputs=True,
             )
             batch_loss = float(output.metrics.get("loss", float("nan")))
             total_loss_weighted += batch_loss * nonpad_tokens
             total_tokens += nonpad_tokens
 
+            # ``logprobs`` holds the last ``valid_len`` positions of the response
+            # window, where ``valid_len`` is the number of supervised tokens; the
+            # tail of the supervision mask picks the supervised ones among them.
+            for i, sample in enumerate(output.loss_fn_outputs):
+                row_mask = supervised[i]
+                valid_len = int(row_mask.sum())
+                lp = np.asarray(sample.get("logprobs", []), dtype=np.float64)
+                if valid_len == 0 or lp.size != valid_len:
+                    continue
+                tail_mask = row_mask[-valid_len:]
+                lp_sup = lp[tail_mask]
+                if lp_sup.size == 0:
+                    continue
+                num_seqs += 1
+                last_tok_ce_sum += -lp_sup[-1]
+                seq_correct += int(lp_sup[-1] > -ln2)
+                seq_mean_correct += int(-lp_sup.mean() < ln2)
+                tok_correct += int((lp_sup > -ln2).sum())
+                tok_total += int(lp_sup.size)
+
         eval_loss = total_loss_weighted / max(total_tokens, 1)
-        return eval_loss, num_eval_batches
+        stats = {"loss": eval_loss}
+        if num_seqs > 0:
+            stats["last_tok_ce"] = last_tok_ce_sum / num_seqs
+            stats["seq_acc"] = seq_correct / num_seqs
+            stats["seq_acc_mean"] = seq_mean_correct / num_seqs
+            stats["token_acc"] = tok_correct / max(tok_total, 1)
+        return stats, num_eval_batches
 
     def train_step(self, batch: TrainingInputBatch, step: int) -> dict:
         """Execute a single training step: forward_backward + optim_step.
