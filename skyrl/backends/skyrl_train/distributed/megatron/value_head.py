@@ -74,7 +74,7 @@ def value_head_logprobs_unpacked(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     """Same-position class log-probs. ``hidden`` / ``labels`` are ``[B, S, H]`` / ``[B, S]``."""
-    logits = value_head(hidden)
+    logits = value_head(hidden.to(value_head.weight.dtype))
     if temperature != 1.0:
         logits = logits / temperature
     return F.log_softmax(logits.float(), dim=-1).gather(-1, labels.long().unsqueeze(-1)).squeeze(-1)
@@ -127,7 +127,7 @@ def value_head_logprobs_packed(
     else:
         local_labels = same_pos_labels
 
-    logits = value_head(hidden)
+    logits = value_head(hidden.to(value_head.weight.dtype))
     if temperature != 1.0:
         logits = logits / temperature
     probs = F.log_softmax(logits.float(), dim=-1).gather(-1, local_labels.long().unsqueeze(-1)).squeeze(-1)
