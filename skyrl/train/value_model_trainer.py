@@ -1829,9 +1829,6 @@ class ValueModelTrainer:
         num_seqs = 0
         for batch in eval_dataloader:
             num_eval_batches += 1
-            # Recover the 0/1 supervision mask before row padding (padded rows
-            # have an all-zero mask and are skipped in the per-sequence stats).
-            supervised = (batch["loss_mask"] > 0).cpu().numpy()
             # Pad the last (possibly-short) chunk so every dispatch sees exactly
             # ``eval_chunk_size`` rows. ``pad_training_input_batch`` zeros the
             # ``loss_mask`` for padding rows; with ``pad_size=0`` it is a no-op.
@@ -1844,6 +1841,10 @@ class ValueModelTrainer:
                     f"padded rows are masked out of the loss."
                 )
                 batch = pad_training_input_batch(batch, pad_rows)
+            # 0/1 supervision mask taken *after* row padding so its row count
+            # matches ``output.loss_fn_outputs``. Padded rows have an all-zero
+            # mask and are skipped in the per-sequence stats below.
+            supervised = (batch["loss_mask"] > 0).cpu().numpy()
             # Count non-pad response tokens (from the unscaled mask, recovered from the batch)
             # We use the attention_mask response window via collate_sft_batch's loss_mask which
             # was 0/1 before scaling. Recover the count from the batch by counting positive entries.
