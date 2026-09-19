@@ -234,6 +234,17 @@ class SFTConfig(BaseConfig):
     max_ckpts_to_keep: int = -1
     """-1 to keep all checkpoints, N to keep only the last N."""
     resume_from: str = ""  # "" = no resume, "latest" = latest checkpoint, or path to global_step_N dir
+    init_from_ckpt: str = ""
+    """Warm-start from a SkyRL checkpoint's *model weights only*, then train from step 0.
+
+    Path to a ``global_step_N`` directory (or directly to its ``policy/`` subdir).
+    Loads the model state dict from the (Megatron or FSDP) checkpoint and nothing
+    else: optimizer state, LR scheduler, dataloader position and ``global_step`` all
+    start fresh. Intended for curriculum stages where the previous stage's final
+    checkpoint seeds the next run. ``model.path`` must still point at the HF base
+    model (it provides the config/tokenizer and the initial module build). Unlike an
+    HF export, this preserves weights the HF mapping does not know about, such as
+    the value-model ``value_head``. Mutually exclusive with ``resume_from``."""
 
     # ---- HF export ----
     hf_save_interval: int = 0
@@ -575,6 +586,11 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(f"dummy_run_max_steps must be > 0, got {cfg.dummy_run_max_steps}")
     if cfg.max_training_steps is not None and cfg.max_training_steps <= 0:
         raise ValueError(f"max_training_steps must be > 0, got {cfg.max_training_steps}")
+    if cfg.init_from_ckpt and cfg.resume_from:
+        raise ValueError(
+            "init_from_ckpt and resume_from are mutually exclusive: init_from_ckpt warm-starts "
+            "weights only (fresh optimizer/scheduler/step), resume_from continues a run."
+        )
 
     # Dataloader / sampler config
     if cfg.sampler not in _VALID_SAMPLERS:

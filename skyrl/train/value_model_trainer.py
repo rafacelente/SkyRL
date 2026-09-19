@@ -1655,6 +1655,7 @@ class ValueModelTrainer:
         """
         resume_from = self.sft_cfg.resume_from
         if not resume_from:
+            self._init_from_ckpt()
             return 0
 
         if resume_from == "latest":
@@ -1742,6 +1743,30 @@ class ValueModelTrainer:
 
         logger.info(f"Successfully resumed from global_step_{global_step}")
         return global_step
+
+    def _init_from_ckpt(self) -> None:
+        """Warm-start model weights from ``sft_cfg.init_from_ckpt`` (no-op if unset).
+
+        Loads only the model state dict; optimizer, LR scheduler, dataloader
+        position and ``global_step`` are left untouched so training starts at
+        step 0 with a fresh schedule. Accepts a ``global_step_N`` directory or
+        its ``policy/`` subdirectory.
+        """
+        init_from = self.sft_cfg.init_from_ckpt
+        if not init_from:
+            return
+        init_from = init_from.rstrip("/")
+        policy_ckpt_dir = init_from if os.path.basename(init_from) == "policy" else os.path.join(init_from, "policy")
+        if not io.exists(policy_ckpt_dir):
+            raise FileNotFoundError(f"init_from_ckpt: policy checkpoint not found at {policy_ckpt_dir}")
+        logger.info(f"Warm-starting model weights from {policy_ckpt_dir} (optimizer/scheduler/step start fresh)")
+        self.dispatch.load_checkpoint(
+            "policy",
+            policy_ckpt_dir,
+            load_optimizer_states=False,
+            load_lr_scheduler_states=False,
+        )
+        logger.info(f"Loaded model weights from {policy_ckpt_dir}")
 
     # ------------------------------------------------------------------ #
     # Training
