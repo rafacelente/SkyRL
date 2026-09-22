@@ -207,6 +207,9 @@ miniswe = [
 ]
 harbor = [
     "harbor[daytona,modal]",
+    # Jev step weights (examples/train_integrations/harbor/jev_weights); imported lazily,
+    # only needed when generator.jev_weights.enabled=true.
+    "typesafe-sdk>=0.7.0",
 ]
 # Mooncake distributed KV for vLLM: the store connector (MooncakeStoreConnector,
 # KV-cache offloading) and P2P PD transfer (MooncakeConnector). Provides the python

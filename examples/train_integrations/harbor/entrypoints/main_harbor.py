@@ -17,6 +17,8 @@ from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.utils.rate_limiter import RateLimiterConfig
 from ..harbor_generator import HarborGenerator
 from ..dataset import HarborTaskDataset
+from ..jev_weights import JevWeightsConfig
+from ..step_weighted_trainer import StepWeightedGRPOTrainer
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
@@ -35,9 +37,12 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 @dataclass
 class HarborGeneratorConfig(GeneratorConfig):
-    """GeneratorConfig with Harbor-specific rate limiting."""
+    """GeneratorConfig with Harbor-specific rate limiting and optional Jev step weights."""
 
     rate_limit: RateLimiterConfig = field(default_factory=RateLimiterConfig)
+    # Per-step credit weights from Jev (generator.jev_weights.enabled=true). See
+    # examples/train_integrations/harbor/jev_weights/ and the StepWeightedGRPOTrainer contract.
+    jev_weights: JevWeightsConfig = field(default_factory=JevWeightsConfig)
 
 
 @dataclass
@@ -49,6 +54,38 @@ class HarborSkyRLConfig(SkyRLTrainConfig):
 
 
 class HarborExp(BasePPOExp):
+    def get_trainer(
+        self,
+        cfg,
+        tracker,
+        tokenizer,
+        train_dataset,
+        eval_dataset,
+        inference_engine_client,
+        generator,
+        colocate_pg,
+    ):
+        """Stock trainer unless Jev step weights are enabled, then the step-weighted one.
+
+        The weighted trainer is a strict superset: with no ``step_weights`` key in the generator
+        output it behaves exactly like ``RayPPOTrainer``, so gating on the same flag that turns
+        scoring on keeps one switch for the whole feature.
+        """
+        if not cfg.generator.jev_weights.enabled:
+            return super().get_trainer(
+                cfg, tracker, tokenizer, train_dataset, eval_dataset, inference_engine_client, generator, colocate_pg
+            )
+        return StepWeightedGRPOTrainer(
+            cfg=cfg,
+            tracker=tracker,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            inference_engine_client=inference_engine_client,
+            generator=generator,
+            colocate_pg=colocate_pg,
+        )
+
     def get_generator(self, cfg, tokenizer, inference_engine_client):
         """
         Initializes the HarborGenerator.

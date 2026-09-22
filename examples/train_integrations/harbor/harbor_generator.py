@@ -3,7 +3,7 @@ import logging
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 from uuid import uuid4
 
 # Suppress LiteLLM verbose logging
@@ -12,9 +12,9 @@ from loguru import logger
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from harbor.models.agent.rollout_detail import RolloutDetail
-from harbor.models.trial.config import TrialConfig
-from harbor.trial.trial import Trial
+if TYPE_CHECKING:
+    from harbor.models.agent.rollout_detail import RolloutDetail
+
 from skyrl.backends.skyrl_train.inference_servers.base import ConversationType, InferenceEngineInterface
 from skyrl.train.generators.base import (
     GeneratorInput,
@@ -46,7 +46,7 @@ class HarborTrajectoryOutput:
     trajectory_id: TrajectoryID
     # Entire rollout_details list as returned by harbor's agent_result. None for failed trajectories
     # (agent_timeout / error) that we will mask in `build_step_wise_generator_output`.
-    rollout_details: Optional[List[RolloutDetail]] = None
+    rollout_details: Optional[List["RolloutDetail"]] = None
     reward: float = 0.0
     num_turns: int = 0
     # One of: "complete", "context_length", "agent_timeout", "error". Used by
@@ -55,6 +55,10 @@ class HarborTrajectoryOutput:
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: left as None if
     # timing was not recorded.
     e2e_time: Optional[float] = None
+    # One Jev credit weight in [-1, 1] per turn (NaN where scoring failed), or None when
+    # step weighting is disabled / this trajectory was never scored. Emitted as
+    # ``generator_output["step_weights"]`` by ``build_step_wise_generator_output``.
+    step_weights: Optional[List[float]] = None
 
 
 def build_step_wise_generator_output(
@@ -94,6 +98,10 @@ def build_step_wise_generator_output(
     is_last_step_list: List[bool] = []
     out_trajectory_ids: List[TrajectoryID] = []
     rollout_logprobs_list: List[List[float]] = []
+    # One weight per emitted row, aligned 1:1 with response_ids. Only attached to the output
+    # when at least one trajectory was scored (plain runs keep the key absent).
+    step_weights_list: List[float] = []
+    any_step_weights = any(traj.step_weights is not None for traj in trajectory_outputs)
 
     successful_trajectories: List[HarborTrajectoryOutput] = []
     response_ids_for_metrics: List[List[int]] = []
@@ -118,6 +126,8 @@ def build_step_wise_generator_output(
             out_trajectory_ids.append(tid)
             rollout_logprobs_list.append([0.0])
             out_trajectory_generation_times.append(traj.e2e_time)
+            # Placeholder rows are loss-masked; 0.0 keeps them inert under the weighting rule too.
+            step_weights_list.append(0.0)
             continue
 
         # 2.2. For successful trajectories, emit one entry per step.
@@ -164,6 +174,12 @@ def build_step_wise_generator_output(
             is_last_step_list.append(is_last)
             out_trajectory_ids.append(tid)
             rollout_logprobs_list.append(lp)
+            # NaN = "no opinion": the step-weighted trainer maps it to the stock-GRPO identity,
+            # so an unscored turn trains exactly as it would without step weighting.
+            if traj.step_weights is not None and t < len(traj.step_weights):
+                step_weights_list.append(float(traj.step_weights[t]))
+            else:
+                step_weights_list.append(float("nan"))
             # For trajectory completion per turn we just use the trajectory-level e2e time.
             out_trajectory_generation_times.append(traj.e2e_time)
 
@@ -200,7 +216,7 @@ def build_step_wise_generator_output(
     rollout_metrics["generate/num_error_trajectories"] = num_error_trajectories
     rollout_metrics["generate/num_masked_instances"] = len(masked_instance_ids)
 
-    return GeneratorOutput(
+    generator_output = GeneratorOutput(
         prompt_token_ids=prompt_token_ids,
         response_ids=response_ids,
         rewards=rewards,
@@ -213,6 +229,12 @@ def build_step_wise_generator_output(
         # Per-step times, aligned 1:1 with the flattened per-step arrays above.
         trajectory_generation_times=out_trajectory_generation_times,
     )
+    if any_step_weights:
+        assert len(step_weights_list) == len(
+            response_ids
+        ), f"step_weights misaligned: {len(step_weights_list)} weights for {len(response_ids)} rows"
+        generator_output["step_weights"] = step_weights_list
+    return generator_output
 
 
 class HarborGenerator(GeneratorInterface):
@@ -288,6 +310,17 @@ class HarborGenerator(GeneratorInterface):
         rate_limit_config = getattr(generator_cfg, "rate_limit", None)
         self._rate_limiter = create_rate_limiter(rate_limit_config)
 
+        # Optional per-step credit scoring (generator.jev_weights.enabled). None when disabled.
+        from .jev_weights import maybe_build_scorer
+
+        self._jev_scorer = maybe_build_scorer(generator_cfg, tokenizer)
+        if self._jev_scorer is not None and getattr(generator_cfg, "merge_stepwise_output", False):
+            raise ValueError(
+                "generator.jev_weights.enabled=true requires generator.merge_stepwise_output=false: "
+                "step weights are one scalar per turn row, and the prefix-aware merge collapses "
+                "turn rows into merged sequences where that alignment no longer exists."
+            )
+
     def _compute_cache_salt(self) -> Optional[str]:
         """Derive a prefix-cache salt from the current policy version.
 
@@ -317,6 +350,12 @@ class HarborGenerator(GeneratorInterface):
         # Captured once so every trajectory shares the policy version at the start of the batch.
         cache_salt = self._compute_cache_salt()
 
+        # Step weights are a training-only input; eval batches are never scored.
+        batch_metadata = input_batch.get("batch_metadata", None)
+        training_phase = getattr(batch_metadata, "training_phase", "train") if batch_metadata else "train"
+        scoring = self._jev_scorer is not None and training_phase == "train"
+        score_tasks: Dict[int, asyncio.Task] = {}
+
         all_outputs: List[HarborTrajectoryOutput] = [None] * len(prompts)  # type: ignore[list-item]
         progress = tqdm(
             disable=disable_tqdm,  # disable for fully async training
@@ -329,6 +368,13 @@ class HarborGenerator(GeneratorInterface):
         async def _worker(idx, prompt, trajectory_id):
             result = await self._harbor_agent_loop(prompt=prompt, trajectory_id=trajectory_id, cache_salt=cache_salt)
             all_outputs[idx] = result
+            # Submit scoring as a background task rather than awaiting it here: trajectories
+            # finish staggered, so scoring finished ones overlaps generating slower ones, and
+            # this worker's completion is never delayed by the scoring API.
+            if scoring and result.rollout_details:
+                score_tasks[idx] = asyncio.create_task(
+                    self._jev_scorer.score_trajectory(result.rollout_details[0], task_path=prompt)
+                )
             progress.update(1)
 
         try:
@@ -338,9 +384,25 @@ class HarborGenerator(GeneratorInterface):
         finally:
             progress.close()
 
-        return build_step_wise_generator_output(
+        if scoring:
+            weights_by_idx = await self._jev_scorer.collect(score_tasks)
+            for idx, weights in weights_by_idx.items():
+                # An empty list means scoring failed or missed the deadline; leaving
+                # step_weights=None makes the flatten emit NaN (stock GRPO) for those rows.
+                if weights:
+                    all_outputs[idx].step_weights = weights
+
+        generator_output = build_step_wise_generator_output(
             all_outputs, overlong_filtering=self.generator_cfg.apply_overlong_filtering
         )
+
+        if scoring:
+            jev_metrics = self._jev_scorer.pop_metrics(weights_by_trajectory=[w for w in weights_by_idx.values() if w])
+            # `or {}` would silently drop the update when rollout_metrics is an empty dict.
+            metrics = generator_output.get("rollout_metrics") or {}
+            metrics.update(jev_metrics)
+            generator_output["rollout_metrics"] = metrics
+        return generator_output
 
     async def _harbor_agent_loop(
         self,
@@ -379,6 +441,11 @@ class HarborGenerator(GeneratorInterface):
                     if not isinstance(extra_body, dict):
                         raise TypeError("harbor_trial_config.agent.kwargs.llm_kwargs.extra_body must be a mapping")
                     extra_body["cache_salt"] = cache_salt
+                # Imported here rather than at module top so the module (and its CPU tests)
+                # loads without the `harbor` extra installed.
+                from harbor.models.trial.config import TrialConfig
+                from harbor.trial.trial import Trial
+
                 trial_config = TrialConfig.model_validate(config)
                 trial = await Trial.create(trial_config)
 

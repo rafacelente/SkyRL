@@ -39,3 +39,38 @@ uv run examples/train_integrations/harbor/prepare_harbor_dataset.py \
 # 3. Launch training
 bash examples/train_integrations/harbor/run_codecontest.sh
 ```
+
+
+## Jev step weights (optional)
+
+Per-step credit weights from the Jev classifier, consumed by the step-weighted GRPO trainer
+(`examples/train/step_wise/mock_grpo_step.py` documents the contract: one weight in [-1, 1] per
+flattened step row, `adv = |traj_adv| * w`, NaN = stock GRPO for that row).
+
+```bash
+export TYPESAFE_API_KEY=...   # required when enabled
+
+... entrypoints.main_harbor \
+  generator.jev_weights.enabled=true \
+  generator.jev_weights.context=window4 \        # window4 | full | rl_online
+  generator.jev_weights.model=jev-1.13 \         # pin it; jev-latest drifting mid-run confounds
+  generator.jev_weights.cache_dir=~/.cache/jev \
+  generator.jev_weights.dump_dir=~/jev_dumps     # (state, probs) audit JSONL every N batches
+```
+
+How it behaves:
+
+- Scoring runs per trajectory at completion, as background asyncio tasks inside `generate()`,
+  so it overlaps generation of slower trajectories. A batch deadline
+  (`jev_weights.collect_deadline_s`) bounds the wait after the last trajectory.
+- Every failure path (timeout, API error, deadline, open circuit breaker, 402) emits NaN, and the
+  trainer maps NaN to exactly stock GRPO for those rows. The scorer being down never blocks or
+  corrupts a run.
+- Watch `jev/icc` in the rollout metrics: near 1.0 means the scorer has collapsed to
+  trajectory-level judgment (its weights just re-derive the outcome). Healthy is ~0.36. Also
+  `jev/fallback_rate`, `jev/latency_p95_s`, and the label split.
+- Eval batches are never scored.
+
+Design, offline validation (rho 0.625 vs reference labels, calibration, throughput math):
+`post-training/jev-like-plr/docs/skyrl-jev-integration.md`. The rubric in `jev_weights/questions.py`
+is vendored from that repo — change it there, re-validate, then re-vendor.
