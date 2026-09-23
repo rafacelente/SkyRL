@@ -30,15 +30,18 @@ _BLANK_RUN = re.compile(r"\n{3,}")
 
 TRUNCATION_MARK = "\n[... {dropped} chars omitted ...]\n"
 
-# Char caps per section (~4 chars/token). Sized so a window4 state lands near the 7.2k tokens
-# validated offline, comfortably under Jev's 32k state limit even with tokenizer slack.
-INSTRUCTION_CAP = 24_000
-TESTS_CAP = 24_000
-FOCAL_ACTION_CAP = 16_000
-FOCAL_RESULT_CAP = 20_000
-CONTEXT_ACTION_CAP = 2_400
-CONTEXT_RESULT_CAP = 2_400
-ONELINE_CAP = 360
+# Char caps per section — the values validated offline in jev-like-plr (RenderOptions.focal /
+# .context are CHAR caps there too). Worst case a window4 state sums to ~32k chars (~8-9k Jev
+# tokens), safely under the 32k-token state limit. An earlier revision shipped these x4 (chars
+# mistaken for tokens): fine on terminal-bench content that never filled the caps, a guaranteed
+# max_tokens storm on content-rich computer-control observations.
+INSTRUCTION_CAP = 6_000
+TESTS_CAP = 6_000
+FOCAL_ACTION_CAP = 4_000
+FOCAL_RESULT_CAP = 5_000
+CONTEXT_ACTION_CAP = 600
+CONTEXT_RESULT_CAP = 600
+ONELINE_CAP = 160
 
 TASK_FILE_SUFFIXES = (".py", ".sh", ".txt", ".toml", ".json", ".yaml", ".yml")
 

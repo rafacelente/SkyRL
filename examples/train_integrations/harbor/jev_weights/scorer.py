@@ -27,7 +27,7 @@ from .questions import CONTRIBUTION_LEVELS, CONTRIBUTION_QUESTION
 from .state import CONTEXT_MODES, build_state, load_task_material, split_turns
 
 NAN = float("nan")
-SHRINK_SCALES = (1.0, 0.5, 0.25)
+SHRINK_SCALES = (1.0, 0.5, 0.25, 0.1)
 
 
 class _CircuitBreaker:
@@ -38,6 +38,7 @@ class _CircuitBreaker:
         self.consecutive = 0
         self.open = False
         self.reason = ""
+        self._announced = False
 
     def record_success(self) -> None:
         self.consecutive = 0
@@ -47,10 +48,18 @@ class _CircuitBreaker:
         text = str(error)
         if "402" in text or "credit" in text.lower():
             self.open, self.reason = True, "API returned 402 (out of credits)"
+        elif "Unknown model" in text:
+            # A config typo fails every request identically; retrying only triggers the API
+            # edge protection (403 storms). One loud line beats 25 identical failures.
+            self.open, self.reason = True, f"invalid jev_weights.model ({text[:120]})"
         elif self.consecutive >= self.threshold:
             self.open, self.reason = True, f"{self.consecutive} consecutive failures"
-        if self.open:
-            logger.error(f"Jev circuit breaker OPEN ({self.reason}); training continues as plain GRPO.")
+        if self.open and not self._announced:
+            self._announced = True
+            logger.error(
+                f"Jev circuit breaker OPEN ({self.reason}); last error: {text[:300]} — "
+                "training continues as plain GRPO."
+            )
 
 
 class JevStepScorer:
@@ -71,6 +80,7 @@ class JevStepScorer:
         if self._dump_dir:
             self._dump_dir.mkdir(parents=True, exist_ok=True)
         self._batch_counter = 0
+        self._provenance_logged = False
         self._metrics_reset()
         self._client = client  # tests inject a fake; real client built lazily below
 
@@ -91,8 +101,34 @@ class JevStepScorer:
 
     # ------------------------------------------------------------------ scoring
 
+    def _log_failure(self, error: Exception) -> None:
+        """Surface the first few distinct error bodies per batch; identical repeats stay quiet."""
+        key = str(error)[:80]
+        if key not in self._m["error_kinds"]:
+            self._m["error_kinds"].add(key)
+            if len(self._m["error_kinds"]) <= 3:
+                logger.warning(f"Jev scoring failure ({len(self._m['error_kinds'])}): {str(error)[:400]}")
+
+    async def _log_model_provenance_once(self) -> None:
+        """Record which release the model alias resolves to; aliases drift and runs must be attributable."""
+        if self._provenance_logged:
+            return
+        self._provenance_logged = True
+        try:
+            listing = await self.client.models.list()
+            available = {m.name: m.release_date for m in listing.models}
+            logger.info(f"Jev models available to this key: {available}; using {self.cfg.model!r}")
+            if self.cfg.model not in available:
+                logger.error(
+                    f"jev_weights.model={self.cfg.model!r} is not offered by the API "
+                    f"(valid: {sorted(available)}); every request will 400."
+                )
+        except Exception as error:  # noqa: BLE001 — provenance is best-effort
+            logger.warning(f"could not list Jev models for provenance: {str(error)[:200]}")
+
     async def score_trajectory(self, rollout_detail: Dict[str, Any], task_path: str) -> List[float]:
         """One weight per turn. Any per-turn failure is NaN; the list length always matches."""
+        await self._log_model_provenance_once()
         turns = split_turns(rollout_detail, self.tokenizer)
         if not turns:
             return []
@@ -118,7 +154,9 @@ class JevStepScorer:
                     )
             except Exception as error:  # noqa: BLE001 — every failure becomes NaN, never a crash
                 if "max_tokens" in str(error) and scale != SHRINK_SCALES[-1]:
+                    self._m["shrinks"] += 1
                     continue  # state too long for the API's tokenizer: shrink and retry
+                self._log_failure(error)
                 self.breaker.record_failure(error)
                 self._m["errors"] += 1
                 self._m["fallbacks"] += 1
@@ -216,6 +254,8 @@ class JevStepScorer:
             "errors": 0,
             "fallbacks": 0,
             "deadline_cancels": 0,
+            "shrinks": 0,
+            "error_kinds": set(),
         }
 
     def pop_metrics(self, weights_by_trajectory: Optional[List[List[float]]] = None) -> Dict[str, float]:
@@ -229,6 +269,7 @@ class JevStepScorer:
             "jev/cache_hit_rate": m["cache_hits"] / max(1, scored),
             "jev/api_errors": float(m["errors"]),
             "jev/deadline_cancels": float(m["deadline_cancels"]),
+            "jev/shrink_retries": float(m["shrinks"]),
             "jev/circuit_open": float(self.breaker.open),
         }
         if weights:

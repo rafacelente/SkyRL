@@ -21,7 +21,10 @@ class JevWeightsConfig:
     #   rl_online: 4 turns back, nothing forward, no trajectory length.   rho 0.603, causal.
     context: str = "window4"
 
-    # Pin this for real runs: "jev-latest" silently changing mid-run confounds everything.
+    # The API offers only rolling aliases ("jev-latest", "jev-preview") — there are no pinned
+    # version ids, so alias drift mid-run cannot be ruled out by config. The scorer logs each
+    # alias's release date at startup so every run records which release it actually got. An
+    # invalid name here fails every request with 400 "Unknown model" (breaker opens immediately).
     model: str = "jev-latest"
 
     # ~14 concurrent requests saturates the documented 1,200 req/min account cap.

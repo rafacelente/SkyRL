@@ -304,3 +304,22 @@ def test_jev_weights_with_merged_output_is_rejected_loudly():
             tokenizer=FakeTokenizer(),
             max_seq_len=1024,
         )
+
+
+def test_unknown_model_opens_the_breaker_immediately(tmp_path):
+    """A config typo must be one loud error, not 25 retries that trip the API's edge protection."""
+    scorer = make_scorer(tmp_path, client=FakeClient(error=RuntimeError("400 Unknown model: jev-1.13")))
+    traj = make_traj("a", 0, n_turns=5, reward=1.0)
+    weights = asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    assert all(math.isnan(w) for w in weights)
+    assert scorer.breaker.open and "invalid jev_weights.model" in scorer.breaker.reason
+
+
+def test_worst_case_state_stays_under_the_token_limit():
+    """Content-rich turns (computer-control observations) must not overflow at scale 1.0."""
+    fat = [Turn(action="a" * 50_000, observation="o" * 50_000) for _ in range(20)]
+    material = {"instruction": "i" * 50_000, "tests": "t" * 50_000}
+    state = build_state(fat, focal=10, task_material=material, mode=CONTEXT_MODES["window4"])
+    total_chars = sum(len(v) if isinstance(v, str) else 60 for v in state.values())
+    # ~4 chars/token with headroom for Jev's denser tokenizer: 36k chars ~= 9-11k tokens << 32k.
+    assert total_chars < 40_000, f"worst-case window4 state is {total_chars} chars"

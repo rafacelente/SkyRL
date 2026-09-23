@@ -53,7 +53,7 @@ export TYPESAFE_API_KEY=...   # required when enabled
 ... entrypoints.main_harbor \
   generator.jev_weights.enabled=true \
   generator.jev_weights.context=window4 \        # window4 | full | rl_online
-  generator.jev_weights.model=jev-1.13 \         # pin it; jev-latest drifting mid-run confounds
+  generator.jev_weights.model=jev-latest \         # only jev-latest / jev-preview exist; release date logged at startup
   generator.jev_weights.cache_dir=~/.cache/jev \
   generator.jev_weights.dump_dir=~/jev_dumps     # (state, probs) audit JSONL every N batches
 ```
