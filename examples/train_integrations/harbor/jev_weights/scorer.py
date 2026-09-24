@@ -31,14 +31,38 @@ SHRINK_SCALES = (1.0, 0.5, 0.25, 0.1)
 
 
 class _CircuitBreaker:
-    """Opens after N consecutive failures, or immediately on an out-of-credit response."""
+    """Opens after N consecutive failures, or immediately on a fatal response.
 
-    def __init__(self, threshold: int):
+    Two kinds of open. Permanent (402 out-of-credits, unknown model): nothing heals mid-run, stay
+    open. Transient (failure streaks — e.g. a 403 edge block, observed clearing within minutes):
+    re-probe after ``cooldown_s``; if the API still refuses, the threshold re-opens it for another
+    cooldown, so a dead API costs at most ``threshold`` requests per cooldown window.
+    """
+
+    def __init__(self, threshold: int, cooldown_s: float = 300.0):
         self.threshold = threshold
+        self.cooldown_s = cooldown_s
         self.consecutive = 0
         self.open = False
+        self.permanent = False
         self.reason = ""
+        self.reopens = 0
+        self._reprobe_at = 0.0
         self._announced = False
+
+    def is_open(self) -> bool:
+        if not self.open:
+            return False
+        if self.permanent or self.cooldown_s <= 0:
+            return True
+        if time.monotonic() >= self._reprobe_at:
+            self.open = False
+            self.consecutive = 0
+            self._announced = False
+            self.reopens += 1
+            logger.warning(f"Jev circuit breaker cooldown elapsed ({self.reason}); probing the API again.")
+            return False
+        return True
 
     def record_success(self) -> None:
         self.consecutive = 0
@@ -47,18 +71,20 @@ class _CircuitBreaker:
         self.consecutive += 1
         text = str(error)
         if "402" in text or "credit" in text.lower():
-            self.open, self.reason = True, "API returned 402 (out of credits)"
+            self.open, self.permanent, self.reason = True, True, "API returned 402 (out of credits)"
         elif "Unknown model" in text:
             # A config typo fails every request identically; retrying only triggers the API
             # edge protection (403 storms). One loud line beats 25 identical failures.
-            self.open, self.reason = True, f"invalid jev_weights.model ({text[:120]})"
+            self.open, self.permanent, self.reason = True, True, f"invalid jev_weights.model ({text[:120]})"
         elif self.consecutive >= self.threshold:
             self.open, self.reason = True, f"{self.consecutive} consecutive failures"
+            self._reprobe_at = time.monotonic() + self.cooldown_s
         if self.open and not self._announced:
             self._announced = True
+            recovery = "permanently" if self.permanent else f"re-probing in {self.cooldown_s:.0f}s"
             logger.error(
-                f"Jev circuit breaker OPEN ({self.reason}); last error: {text[:300]} — "
-                "training continues as plain GRPO."
+                f"Jev circuit breaker OPEN ({self.reason}, {recovery}); last error: {text[:300]} — "
+                "training continues as plain GRPO meanwhile."
             )
 
 
@@ -71,8 +97,11 @@ class JevStepScorer:
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.mode = CONTEXT_MODES[cfg.context]
-        self.breaker = _CircuitBreaker(cfg.circuit_breaker_failures)
+        self.breaker = _CircuitBreaker(cfg.circuit_breaker_failures, cooldown_s=cfg.breaker_cooldown_s)
         self._semaphore = asyncio.Semaphore(cfg.concurrency)
+        self._pace_interval = 60.0 / cfg.requests_per_minute if cfg.requests_per_minute > 0 else 0.0
+        self._pace_lock = asyncio.Lock()
+        self._next_slot = 0.0
         self._cache_dir = Path(cfg.cache_dir).expanduser() if cfg.cache_dir else None
         if self._cache_dir:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -136,8 +165,20 @@ class JevStepScorer:
         results = await asyncio.gather(*(self._score_turn(turns, t, material, task_path) for t in range(len(turns))))
         return list(results)
 
+    async def _pace(self) -> None:
+        """Space requests to ``requests_per_minute``. The edge answers over-rate with 403, not 429."""
+        if self._pace_interval <= 0:
+            return
+        async with self._pace_lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_slot - now)
+            self._next_slot = max(now, self._next_slot) + self._pace_interval
+        if wait > 0:
+            self._m["pace_wait_s"] += wait
+            await asyncio.sleep(wait)
+
     async def _score_turn(self, turns, focal: int, material: Dict[str, str], task_path: str) -> float:
-        if self.breaker.open:
+        if self.breaker.is_open():
             self._m["fallbacks"] += 1
             return NAN
         for scale in SHRINK_SCALES:
@@ -149,6 +190,10 @@ class JevStepScorer:
             start = time.monotonic()
             try:
                 async with self._semaphore:
+                    await self._pace()
+                    if self.breaker.is_open():
+                        self._m["fallbacks"] += 1
+                        return NAN
                     response = await self.client.system_one(
                         state=state, questions={"contribution": CONTRIBUTION_QUESTION}
                     )
@@ -195,7 +240,11 @@ class JevStepScorer:
             task.cancel()
         if pending:
             self._m["deadline_cancels"] += len(pending)
-            logger.warning(f"Jev collect deadline hit; {len(pending)} trajectories fall back to plain GRPO.")
+            logger.warning(
+                f"Jev collect deadline ({deadline:.0f}s) hit; {len(pending)} trajectories fall back "
+                "to plain GRPO. If jev/pace_wait_s is high, raise jev_weights.collect_deadline_s or "
+                "requests_per_minute."
+            )
         out: Dict[int, List[float]] = {}
         for idx, task in tasks.items():
             if task in pending or task.cancelled() or task.exception() is not None:
@@ -255,6 +304,7 @@ class JevStepScorer:
             "fallbacks": 0,
             "deadline_cancels": 0,
             "shrinks": 0,
+            "pace_wait_s": 0.0,
             "error_kinds": set(),
         }
 
@@ -270,7 +320,9 @@ class JevStepScorer:
             "jev/api_errors": float(m["errors"]),
             "jev/deadline_cancels": float(m["deadline_cancels"]),
             "jev/shrink_retries": float(m["shrinks"]),
-            "jev/circuit_open": float(self.breaker.open),
+            "jev/pace_wait_s": float(m["pace_wait_s"]),
+            "jev/breaker_reopens": float(self.breaker.reopens),
+            "jev/circuit_open": float(self.breaker.is_open()),
         }
         if weights:
             out["jev/weight_mean"] = sum(weights) / scored

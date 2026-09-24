@@ -323,3 +323,54 @@ def test_worst_case_state_stays_under_the_token_limit():
     total_chars = sum(len(v) if isinstance(v, str) else 60 for v in state.values())
     # ~4 chars/token with headroom for Jev's denser tokenizer: 36k chars ~= 9-11k tokens << 32k.
     assert total_chars < 40_000, f"worst-case window4 state is {total_chars} chars"
+
+
+def test_transient_breaker_reprobes_after_cooldown(tmp_path):
+    """A 403 edge block clears in minutes; the breaker must come back, not stay dead all run."""
+    client = FakeClient(error=RuntimeError("403 Forbidden"))
+    scorer = make_scorer(tmp_path, client=client, circuit_breaker_failures=2, breaker_cooldown_s=0.2)
+    traj = make_traj("a", 0, n_turns=4, reward=1.0)
+    asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    assert scorer.breaker.open and not scorer.breaker.permanent
+
+    import time as _time
+
+    _time.sleep(0.25)
+    client.error = None  # the edge unblocked us
+    weights = asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    assert not scorer.breaker.open
+    assert not any(math.isnan(w) for w in weights), "scoring must resume after the cooldown probe"
+    assert scorer.breaker.reopens == 1
+
+
+def test_permanent_breaker_never_reprobes(tmp_path):
+    scorer = make_scorer(tmp_path, client=FakeClient(error=RuntimeError("402 no credits")), breaker_cooldown_s=0.01)
+    traj = make_traj("a", 0, n_turns=1, reward=1.0)
+    asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    import time as _time
+
+    _time.sleep(0.05)
+    assert scorer.breaker.is_open(), "402 must not heal on a timer"
+
+
+def test_pacing_spaces_requests(tmp_path):
+    """With requests_per_minute set, N calls cannot complete faster than (N-1) intervals."""
+    import time as _time
+
+    scorer = make_scorer(tmp_path, client=FakeClient(), requests_per_minute=600.0)  # 0.1s interval
+    traj = make_traj("a", 0, n_turns=5, reward=1.0)
+    start = _time.monotonic()
+    weights = asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    elapsed = _time.monotonic() - start
+    assert len(weights) == 5 and not any(math.isnan(w) for w in weights)
+    assert elapsed >= 0.4, f"5 calls at 600/min must take >=0.4s, took {elapsed:.2f}s"
+
+
+def test_pacing_disabled_at_zero(tmp_path):
+    import time as _time
+
+    scorer = make_scorer(tmp_path, requests_per_minute=0.0)
+    traj = make_traj("a", 0, n_turns=5, reward=1.0)
+    start = _time.monotonic()
+    asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
+    assert _time.monotonic() - start < 0.3
