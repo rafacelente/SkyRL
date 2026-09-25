@@ -62,7 +62,9 @@ class HarborTrajectoryOutput:
 
 
 def build_step_wise_generator_output(
-    trajectory_outputs: List[HarborTrajectoryOutput], overlong_filtering: bool
+    trajectory_outputs: List[HarborTrajectoryOutput],
+    overlong_filtering: bool,
+    include_step_weights: Optional[bool] = None,
 ) -> GeneratorOutput:
     """Flatten per-trajectory rollout details into one entry per LLM turn.
 
@@ -101,7 +103,14 @@ def build_step_wise_generator_output(
     # One weight per emitted row, aligned 1:1 with response_ids. Only attached to the output
     # when at least one trajectory was scored (plain runs keep the key absent).
     step_weights_list: List[float] = []
-    any_step_weights = any(traj.step_weights is not None for traj in trajectory_outputs)
+    # Whether the output carries the key must be uniform across every output of a run: the
+    # fully-async trainer concatenates buffered outputs and hard-indexes the first one's keys
+    # into all of them, so an output that skipped the key (e.g. a prompt group whose every
+    # rollout was masked, leaving nothing to score) crashes the concat — or, if it comes
+    # first, silently drops every other output's weights. Callers pass the config+phase
+    # decision explicitly; None falls back to inference for direct/legacy callers.
+    if include_step_weights is None:
+        include_step_weights = any(traj.step_weights is not None for traj in trajectory_outputs)
 
     successful_trajectories: List[HarborTrajectoryOutput] = []
     response_ids_for_metrics: List[List[int]] = []
@@ -229,7 +238,7 @@ def build_step_wise_generator_output(
         # Per-step times, aligned 1:1 with the flattened per-step arrays above.
         trajectory_generation_times=out_trajectory_generation_times,
     )
-    if any_step_weights:
+    if include_step_weights:
         assert len(step_weights_list) == len(
             response_ids
         ), f"step_weights misaligned: {len(step_weights_list)} weights for {len(response_ids)} rows"
@@ -393,7 +402,11 @@ class HarborGenerator(GeneratorInterface):
                     all_outputs[idx].step_weights = weights
 
         generator_output = build_step_wise_generator_output(
-            all_outputs, overlong_filtering=self.generator_cfg.apply_overlong_filtering
+            all_outputs,
+            overlong_filtering=self.generator_cfg.apply_overlong_filtering,
+            # Uniform across the whole training phase, independent of whether scoring succeeded
+            # for this particular sub-batch (see the note in build_step_wise_generator_output).
+            include_step_weights=scoring,
         )
 
         if scoring:

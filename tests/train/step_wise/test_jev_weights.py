@@ -374,3 +374,35 @@ def test_pacing_disabled_at_zero(tmp_path):
     start = _time.monotonic()
     asyncio.run(scorer.score_trajectory(traj.rollout_details[0], task_path=str(tmp_path)))
     assert _time.monotonic() - start < 0.3
+
+
+def test_fully_masked_output_still_carries_the_key_when_scoring_is_on():
+    """Regression for the step-14 crash: the fully-async trainer concatenates buffered outputs and
+    hard-indexes the first one's keys into all of them. A prompt group whose every rollout was
+    masked produces no scores, but its output must still carry step_weights."""
+    from skyrl.train.generators.utils import concatenate_generator_outputs
+
+    scored = build_step_wise_generator_output(
+        [make_traj("a", 0, n_turns=3, reward=1.0, step_weights=[0.1, 0.2, 0.3])],
+        overlong_filtering=False,
+        include_step_weights=True,
+    )
+    all_masked = build_step_wise_generator_output(
+        [make_traj("b", 0, n_turns=2, reward=0.0, stop="error")],
+        overlong_filtering=False,
+        include_step_weights=True,
+    )
+    assert "step_weights" in all_masked and all_masked["step_weights"] == [0.0]
+
+    merged = concatenate_generator_outputs([scored, all_masked], step_wise=True)
+    assert merged["step_weights"] == [0.1, 0.2, 0.3, 0.0]
+    assert len(merged["step_weights"]) == len(merged["response_ids"])
+
+
+def test_scoring_disabled_keeps_the_key_absent_uniformly():
+    out = build_step_wise_generator_output(
+        [make_traj("a", 0, n_turns=2, reward=1.0, step_weights=[0.4, 0.5])],
+        overlong_filtering=False,
+        include_step_weights=False,
+    )
+    assert "step_weights" not in out
