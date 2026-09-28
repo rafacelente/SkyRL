@@ -1409,6 +1409,18 @@ class RayPPOTrainer:
                         "policy/rollout_train_logprobs_abs_diff_std": logprobs_diff_std,
                     }
                 )
+                if self.cfg.trainer.logprob_mismatch_topk > 0:
+                    from skyrl.train.utils.logprob_mismatch import (
+                        log_top_logprob_mismatches,
+                    )
+
+                    log_top_logprob_mismatches(
+                        training_input,
+                        action_log_probs,
+                        self.tokenizer,
+                        top_k=self.cfg.trainer.logprob_mismatch_topk,
+                        all_metrics=self.all_metrics,
+                    )
         return training_input
 
     def apply_reward_kl_penalty(

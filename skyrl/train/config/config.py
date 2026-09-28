@@ -1423,6 +1423,14 @@ class MTPConfig(BaseConfig):
 @dataclass
 class TrainerConfig(BaseConfig):
     placement: PlacementConfig = field(default_factory=PlacementConfig)
+    logprob_mismatch_topk: int = 0
+    """When > 0, log the top-k largest |rollout - train| logprob gaps each step with decoded
+    tokens, positions, and loss-mask-boundary classification, plus a
+    ``policy/logprob_mismatch_boundary_share`` metric. Diagnoses whether a large
+    ``rollout_train_logprobs_abs_diff_max`` comes from chat-template/retokenization drift
+    (mismatches cluster at mask boundaries) or engine numerics (spread over interior tokens).
+    Driver-side and cheap; 0 disables."""
+
     use_expandable_segments: bool = True
     """Enable PyTorch's CUDA ``expandable_segments`` allocator on the training workers.
 

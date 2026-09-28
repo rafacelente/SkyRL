@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import time
 from pathlib import Path
@@ -96,6 +97,12 @@ class JevStepScorer:
             raise ValueError(f"jev_weights.context must be one of {sorted(CONTEXT_MODES)}, got {cfg.context!r}")
         self.cfg = cfg
         self.tokenizer = tokenizer
+        if cfg.quiet_http_logs:
+            # One line per request at INFO ("200 OK", plus the transport echo) times ~200k calls
+            # per epoch buries everything else in the training log. Failures keep surfacing
+            # through the scorer's own logging, which carries the error body and context.
+            for name in ("typesafe_sdk", "httpx2", "httpx"):
+                logging.getLogger(name).setLevel(logging.WARNING)
         self.mode = CONTEXT_MODES[cfg.context]
         self.breaker = _CircuitBreaker(cfg.circuit_breaker_failures, cooldown_s=cfg.breaker_cooldown_s)
         self._semaphore = asyncio.Semaphore(cfg.concurrency)

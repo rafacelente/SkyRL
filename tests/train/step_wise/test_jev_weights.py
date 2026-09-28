@@ -406,3 +406,21 @@ def test_scoring_disabled_keeps_the_key_absent_uniformly():
         include_step_weights=False,
     )
     assert "step_weights" not in out
+
+
+def test_quiet_http_logs_raises_library_logger_levels(tmp_path):
+    import logging
+
+    for name in ("typesafe_sdk", "httpx2"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+    make_scorer(tmp_path)
+    assert logging.getLogger("typesafe_sdk").level == logging.WARNING
+    assert logging.getLogger("httpx2").level == logging.WARNING
+
+
+def test_quiet_http_logs_can_be_disabled(tmp_path):
+    import logging
+
+    logging.getLogger("typesafe_sdk").setLevel(logging.NOTSET)
+    make_scorer(tmp_path, quiet_http_logs=False)
+    assert logging.getLogger("typesafe_sdk").level == logging.NOTSET

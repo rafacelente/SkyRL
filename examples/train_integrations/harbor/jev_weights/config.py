@@ -48,6 +48,11 @@ class JevWeightsConfig:
     # trials themselves take minutes, so a generous deadline costs little and saves coverage.
     collect_deadline_s: float = 600.0
 
+    # Silence per-request INFO lines from the TypeSafe SDK transport and httpx2 ("200 OK" for
+    # every call floods the training log). Failures still surface: the scorer logs the first
+    # distinct error bodies per batch and the circuit breaker announces itself with the cause.
+    quiet_http_logs: bool = True
+
     # After this many consecutive API failures (or any 402) the breaker opens: no further
     # calls this run, every weight NaN, training degrades to plain GRPO.
     circuit_breaker_failures: int = 25
