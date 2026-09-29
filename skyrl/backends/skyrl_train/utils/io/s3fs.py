@@ -1,6 +1,8 @@
+import time
 from datetime import datetime, timedelta, timezone
 
 import fsspec
+from loguru import logger
 
 # Optional AWS deps (present when s3fs is installed)
 try:
@@ -57,18 +59,64 @@ def s3_refresh_if_expiring(fs) -> None:
             pass
 
 
+def _transient_transport_errors() -> tuple:
+    """Exception types worth retrying: the connection died, not the request being wrong.
+
+    Built lazily because aiohttp is only guaranteed present alongside s3fs. A multi-gigabyte
+    checkpoint download holds sockets open for many minutes; under fd pressure or endpoint
+    hiccups (GCS's S3-compat interop included) a chunk dies mid-stream as ClientPayloadError
+    ("Not enough data to satisfy content length header") — observed killing a resume that had
+    already spent 29 minutes downloading.
+    """
+    errors: list = [ConnectionError, TimeoutError]
+    try:
+        import aiohttp
+
+        errors += [
+            aiohttp.ClientPayloadError,
+            aiohttp.ClientOSError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientConnectorError,
+            aiohttp.ServerTimeoutError,
+        ]
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+_TRANSIENT_MAX_RETRIES = 4
+_TRANSIENT_BACKOFF_S = 2.0
+
+
 def call_with_s3_retry(fs, fn, *args, **kwargs):
     """
-    Wrapper for calling an S3 method. If it fails with ExpiredToken, force refresh once and retry.
+    Wrapper for calling an S3 method.
+
+    - ExpiredToken and friends: force one credential refresh and retry.
+    - Transient transport failures (truncated payload, reset, disconnect, timeout): retry up to
+      ``_TRANSIENT_MAX_RETRIES`` times with exponential backoff. Anything else raises immediately.
     """
-    try:
-        return fn(*args, **kwargs)
-    except ClientError as e:
-        code = getattr(e, "response", {}).get("Error", {}).get("Code")
-        if code in {"ExpiredToken", "ExpiredTokenException", "RequestExpired"} and hasattr(fs, "connect"):
-            try:
-                fs.connect(refresh=True)
-            except Exception:
-                pass
+    transient = _transient_transport_errors()
+    attempt = 0
+    while True:
+        try:
             return fn(*args, **kwargs)
-        raise
+        except ClientError as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code")
+            if code in {"ExpiredToken", "ExpiredTokenException", "RequestExpired"} and hasattr(fs, "connect"):
+                try:
+                    fs.connect(refresh=True)
+                except Exception:
+                    pass
+                return fn(*args, **kwargs)
+            raise
+        except transient as e:
+            attempt += 1
+            if attempt > _TRANSIENT_MAX_RETRIES:
+                raise
+            wait = _TRANSIENT_BACKOFF_S * (2 ** (attempt - 1))
+            logger.warning(
+                f"transient S3 transport failure ({type(e).__name__}: {str(e)[:200]}); "
+                f"retry {attempt}/{_TRANSIENT_MAX_RETRIES} in {wait:.0f}s"
+            )
+            time.sleep(wait)
